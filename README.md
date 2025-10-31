@@ -1,5 +1,7 @@
 # CameraFlow
 
+## Evaluation
+
 处理 WebVID 开源数据集可以直接执行生成，结构目录如下
 ```
 .WebVID
@@ -84,8 +86,64 @@ pip install transformers==4.46.2
 ```
 
 执行 CameraFlow/glomap.py 实现调用 Glomap 前处理 + 指标计算后处理一条龙服务
+
 TODO: 可能出现3分钟都处理不出来的怪东西；结果保存在 csv 文件中，但是字符串而非 float
 ```
  conda activate wan
  CUDA_VISIBLE_DEVICES=1 python glomap.py
+```
+
+## MultiCamDataset Preprocess
+
+发布者并未给出 caption 的获得方式。gen_metadata_csv.py 是一个基于 Qwen2.5-VL-3B-Instruct-AWQ 推理的脚本，需要强制在单卡4090上运行，否则会报错 tensor 位置不同。
+
+该版本并非完整版，只处理了 /train/f18_aperture10 下的视频，
+
+该版本并非稳定版，首先需要手动处理脚本检测出的空行，最后再将所有 !!!! 感叹号按照同一场景下的其他视频的 caption 复制粘贴过来
+```
+conda activate wlh-py
+cd /data/wlh/ReCamMaster/MultiCamVideo-Dataset
+CUDA_VISIBLE_DEVICES=0  python gen_metadata_csv.py
+```
+
+数据集文件夹架构如下：（在训练前还要先逐一用 VAE 处理提取为同路径同名 cam01.pth 文件）
+```
+MultiCamVideo-Dataset
+├── train
+│   ├── f18_aperture10
+│   │   ├── scene1    # one dynamic scene
+│   │   │   ├── videos
+│   │   │   │   ├── cam01.mp4    # synchronized 81-frame videos at 1280x1280 resolution
+│   │   │   │   ├── cam02.mp4
+│   │   │   │   ├── ...
+│   │   │   │   └── cam10.mp4
+│   │   │   └── cameras
+│   │   │       └── camera_extrinsics.json    # 81-frame camera extrinsics of the 10 cameras 
+│   │   ├── ...
+│   │   └── scene3400
+│   │       └── ...
+│   ├── f24_aperture5
+│   │   └── ...
+│   ├── f35_aperture2.4
+│   │   └── ...
+│   └── f50_aperture2.4
+│       └── ...
+│── val
+│    └── 10basic_trajectories
+│        ├── videos
+│        │   ├── cam01.mp4
+│        │   ├── cam02.mp4
+│        │   ├── ...
+│        │   └── cam10.mp4
+│        └── cameras
+│            └── camera_extrinsics.json    # 10 different trajectories for validation
+└── metadata.csv
+```
+
+metadata.csv 的示例内容如下：
+```
+|                 filename                   |                            text                            |
+|:------------------------------------------:|:----------------------------------------------------------:|
+|  f18_aperture10/scene10/videos/cam04.mp4   |  The video depicts a person standing on a wooden deck....  |
+|  f18_aperture10/scene../videos/...         |  ... ...                                                   |
 ```
