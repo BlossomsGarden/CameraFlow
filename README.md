@@ -1,5 +1,34 @@
 # CameraFlow
 
+## TODO
+
+ - Training DiT Forward Runtime Error: Parameter indices which did not receive grad
+ - eval() 函数
+ - vllm 部署 UnifiedReward-2.0-qwen-7b (测试 1.0 3B 效果一般，但 NPU 不支持直接安装 vllm)
+
+
+## Code
+
+源代码文件。核心文件存放位置：
+
+ - Code/setup.py 注释内容依次为 NPU 环境配置所需步骤，未注释内容为原仓库依赖。
+ - Code/scripts/train_recam.py 主训练函数，为方便调试增加 denoise 和 sample 的缓存功能
+ - Code/flow_grpo/rewards.py 奖励函数 
+ - Code/config/grpo.py 重点关注 my_recam_8npu()，配置超参与奖励函数
+ - Code/scripts/recam 因 Pipeline 类为自行实现，存放相关代码
+
+
+单结点 8 卡训练
+```
+bash scripts/single_node/grpo.sh
+```
+
+4 结点 32 卡训练，各节点依次启动
+```
+bash scripts/multi_node/recam/main.sh
+```
+
+
 ## Evaluation
 
 处理 WebVID 开源数据集可以直接执行生成，结构目录如下
@@ -85,7 +114,7 @@ python evaluate.py --videos_path  .results/cam_type1  \
 pip install transformers==4.46.2
 ```
 
-执行 CameraFlow/glomap.py 实现调用 Glomap 前处理 + 指标计算后处理一条龙服务
+执行 CamAccuracy/glomap.py 实现调用 Glomap 前处理 + 指标计算后处理一条龙服务
 
 TODO: 可能出现3分钟都处理不出来的怪东西；结果保存在 csv 文件中，但是字符串而非 float
 ```
@@ -97,9 +126,9 @@ TODO: 可能出现3分钟都处理不出来的怪东西；结果保存在 csv �
 
 发布者并未给出 caption 的获得方式。gen_metadata_csv.py 是一个基于 Qwen2.5-VL-3B-Instruct-AWQ 推理的脚本，需要强制在单卡4090上运行，否则会报错 tensor 位置不同。
 
-该版本并非完整版，只处理了 /train/f18_aperture10 下的视频，
+该版本并非稳定版，首先需要手动处理脚本检测出的空行，最后再将所有 !!!! 感叹号按照同一场景下的其他视频的 caption 复制粘贴过来。
+同时，人工检查发现幻觉较为严重，例如所有视频均为单人在原地跳舞，但却会被大量识别出两个人、摄像头靠近主体会被解释为人正跑向相机、摄像头向上俯视会被解释为摔倒等等。
 
-该版本并非稳定版，首先需要手动处理脚本检测出的空行，最后再将所有 !!!! 感叹号按照同一场景下的其他视频的 caption 复制粘贴过来
 ```
 conda activate wlh-py
 cd /data/wlh/ReCamMaster/MultiCamVideo-Dataset
