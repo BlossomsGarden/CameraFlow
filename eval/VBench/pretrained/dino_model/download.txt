@@ -1,0 +1,1 @@
+Downloading: "https://dl.fbaipublicfiles.com/dino/dino_vitbase16_pretrain/dino_vitbase16_pretrain.pth" to /home/wlh/.cache/torch/hub/checkpoints/dino_vitbase16_pretrain.pth

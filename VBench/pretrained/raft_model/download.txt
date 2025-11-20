@@ -1,2 +1,0 @@
-DOWNLOAD: https://huggingface.co/ddrfan/RAFT/blob/main/raft-things.pth
-PUT: /home/wlh/.cache/vbench/raft_model/models/raft-things.pth

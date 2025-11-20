@@ -5,15 +5,15 @@
  - 看效果如何要不要 vllm 部署 UnifiedReward-2.0-qwen-7b
 
 
-## Code
+## Train
 
 源代码文件。核心文件存放位置：
 
- - Code/setup.py 注释内容依次为 NPU 环境配置所需步骤，未注释内容为原仓库依赖。
- - Code/scripts/train_recam.py 主训练函数，为方便调试增加 denoise 和 sample 的缓存功能
- - Code/flow_grpo/rewards.py 奖励函数 
- - Code/config/grpo.py 重点关注 my_recam_8npu()，配置超参与奖励函数
- - Code/scripts/recam 因 Pipeline 类为自行实现，存放相关代码
+ - setup.py 注释内容依次为 NPU 环境配置所需步骤，未注释内容为原仓库依赖。
+ - scripts/train_recam.py 主训练函数，为方便调试增加 denoise 和 sample 的缓存功能
+ - flow_grpo/rewards.py 奖励函数 
+ - config/grpo.py 重点关注 my_recam_8npu()，配置超参与奖励函数
+ - scripts/recam 因 Pipeline 类为自行实现，存放相关代码
 
 
 单结点 8 卡训练
@@ -26,8 +26,45 @@ bash scripts/single_node/grpo.sh
 bash scripts/multi_node/recam/main.sh
 ```
 
+启动训练时数据集文件夹架构如下。
+dataset_tools/ 中给出供训练用的精简版 csv 文件，谨慎使用，具体查看 Dataset Preprocess部分。
+```
+MultiCamVideo-Dataset
+├── train
+│   ├── f24_aperture5
+│   │   ├── scene1    # one dynamic scene
+│   │   │   ├── videos
+│   │   │   │   ├── cam01.mp4                 # synchronized 81-frame videos at 1280x1280 resolution
+│   │   │   │   ├── cam01.mp4.tensor.pth      # pre-encoded input
+│   │   │   │   ├── cam02.mp4
+│   │   │   │   ├── cam02.mp4.tensor.pth
+│   │   │   │   ├── ...
+│   │   │   │   ├── cam10.mp4
+│   │   │   │   └── cam10.mp4.tensor.pth
+│   │   │   └── cameras
+│   │   │       └── camera_extrinsics.json    # 81-frame camera extrinsics of the 10 cameras 
+│   │   ├── ...
+│   │   └── scene3400
+│   │       └── ...
+│   ├── f35_aperture2.4
+│   │   └── ...
+│   ├── f50_aperture2.4
+│   │   └── ...
+│   └── 10basic_trajectories
+│        ├── videos
+│        │   ├── cam01.mp4
+│        │   ├── cam01.mp4.tensor.pth  
+│        │   ├── ...
+│        │   ├── cam10.mp4
+│        │   └── cam10.mp4.tensor.pth  
+│        └── cameras
+│            └── camera_extrinsics.json
+├── metadata-test.csv
+└── metadata-train.csv
+```
 
-## Evaluation
+
+## Evaluate
 
 处理 WebVID 开源数据集可以直接执行生成，结构目录如下
 ```
@@ -71,13 +108,13 @@ bash scripts/multi_node/recam/main.sh
     └── ...
 ```
 
-执行 CameraFlow/evaluator.py 调用已有 clip 文件计算 -T -F -V 指标、计算FID FVD (-V 要求10个相机轨迹的视频)
+执行 eval/CamAccuracy/evaluator.py 调用已有 clip 文件计算 -T -F -V 指标、计算FID FVD (-V 要求10个相机轨迹的视频)
 ```
  conda activate wan
  CUDA_VISIBLE_DEVICES=1 python evaluator.py
 ```
 
-执行 GIM/demo.py 计算 source 和 out video 逐帧之间可信的像素对应数。
+执行 eval/GIM/demo.py 计算 source 和 out video 逐帧之间可信的像素对应数。
 ```
  conda env  create -f environment.yaml
  conda activate gim
@@ -96,7 +133,7 @@ gim_roma_100h.ckpt
 object150_info.csv
 resnet50-0676ba61.pth
 ```
-执行 VBench/evaluate.py 计算视频评价指标。
+执行 eval/VBench/evaluate.py 计算视频评价指标。
 ```
 conda activate wan
 pip install transformers==4.33.2
@@ -112,7 +149,7 @@ python evaluate.py --videos_path  .results/cam_type1  \
 pip install transformers==4.46.2
 ```
 
-执行 CamAccuracy/glomap.py 实现调用 Glomap 前处理 + 指标计算后处理一条龙服务
+执行 eval/CamAccuracy/glomap.py 实现调用 Glomap 前处理 + 指标计算后处理一条龙服务
 
 TODO: 可能出现3分钟都处理不出来的怪东西；结果保存在 csv 文件中，但是字符串而非 float
 ```
@@ -120,24 +157,26 @@ TODO: 可能出现3分钟都处理不出来的怪东西；结果保存在 csv �
  CUDA_VISIBLE_DEVICES=1 python glomap.py
 ```
 
-## MultiCamDataset Preprocess
+## Dataset Preprocess
 
-发布者并未给出 caption 的获得方式。gen_metadata_csv.py 是一个基于 Qwen2.5-VL-3B-Instruct-AWQ 推理的脚本，需要强制在单卡4090上运行，否则会报错 tensor 位置不同。
+发布者并未给出 caption 的获得方式。dataset_tools/gen_metadata_csv.py 是一个基于 Qwen2.5-VL-3B-Instruct-AWQ 推理的脚本，需要强制在单卡4090上运行，否则会报错 tensor 位置不同。dataset_tools/post-handle-csv.py 是一个处理空行和非 UTF-8 字符的后处理脚本。
 
-该版本并非稳定版，首先需要手动处理脚本检测出的空行，最后再将所有 !!!! 感叹号按照同一场景下的其他视频的 caption 复制粘贴过来。
-同时，人工检查发现幻觉较为严重，例如所有视频均为单人在原地跳舞，但却会被大量识别出两个人、摄像头靠近主体会被解释为人正跑向相机、摄像头向上俯视会被解释为摔倒等等。
+该版本并非稳定版，首先需要将所有 !!!! 感叹号按照同一场景下的其他视频的 caption 复制粘贴过来。
+同时，人工检查发现幻觉较为严重，例如所有视频均为单人在原地跳舞，但却会被大量识别出两个人、摄像头靠近主体会被解释为人正跑向相机、摄像头向上俯视会被解释为摔倒等。
+
+PS: dataset_tools/ 中给出 csv 文件，谨慎使用。
 
 ```
-conda activate wlh-py
-cd /data/wlh/ReCamMaster/MultiCamVideo-Dataset
+conda activate xxx-py
+cd /.../MultiCamVideo-Dataset
 CUDA_VISIBLE_DEVICES=0  python gen_metadata_csv.py
 ```
 
-数据集文件夹架构如下：（在训练前还要先逐一用 VAE 处理提取为同路径同名 cam01.pth 文件）
+初始数据集文件夹架构应如下：（在训练前还要先逐一用 VAE 处理提取为同路径同名 cam01.pth 文件）
 ```
 MultiCamVideo-Dataset
 ├── train
-│   ├── f18_aperture10
+│   ├── f18_aperture10 （场景非常暗，不推荐使用）
 │   │   ├── scene1    # one dynamic scene
 │   │   │   ├── videos
 │   │   │   │   ├── cam01.mp4    # synchronized 81-frame videos at 1280x1280 resolution
