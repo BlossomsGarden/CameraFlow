@@ -1,3 +1,2 @@
-from .prompt_refiners import Translator, BeautifulPrompt, QwenPrompt
-from .omost import OmostPromter
+from .prompt_refiners import Translator, QwenPrompt
 from .wan_prompter import WanPrompter

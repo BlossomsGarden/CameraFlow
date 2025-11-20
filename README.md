@@ -1,10 +1,8 @@
 # CameraFlow
 
-## TODO
+## Traning In Process!!! No TODOs Anymore!!!
 
- - Training DiT Forward Runtime Error: Parameter indices which did not receive grad
- - eval() 函数
- - vllm 部署 UnifiedReward-2.0-qwen-7b (测试 1.0 3B 效果一般，但 NPU 不支持直接安装 vllm)
+ - 看效果如何要不要 vllm 部署 UnifiedReward-2.0-qwen-7b
 
 
 ## Code

@@ -610,17 +610,11 @@ def main(_):
     logger.info(f"  Num Epochs = {config.num_epochs}")
     logger.info(f"  Sample batch size per device = {config.sample.train_batch_size}")
     logger.info(f"  Train batch size per device = {config.train.batch_size}")
-    logger.info(
-        f"  Gradient Accumulation steps = {config.train.gradient_accumulation_steps}"
-    )
+    logger.info(f"  Gradient Accumulation steps = {config.train.gradient_accumulation_steps}")
     logger.info("")
     logger.info(f"  Total number of samples per epoch = {samples_per_epoch}")
-    logger.info(
-        f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}"
-    )
-    logger.info(
-        f"  Number of gradient updates per inner epoch = {samples_per_epoch // total_train_batch_size}"
-    )
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
+    logger.info(f"  Number of gradient updates per inner epoch = {samples_per_epoch // total_train_batch_size}")
     logger.info(f"  Number of inner epochs = {config.train.num_inner_epochs}")
     # assert config.sample.train_batch_size >= config.train.batch_size
     # assert config.sample.train_batch_size % config.train.batch_size == 0

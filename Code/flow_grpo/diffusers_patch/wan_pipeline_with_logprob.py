@@ -6,111 +6,82 @@ from diffusers.utils.torch_utils import randn_tensor
 import math
 import numpy as np
 # import logger
+
 def sde_step_with_logprob(
     self: UniPCMultistepScheduler,
     model_output: torch.FloatTensor,
     timestep: Union[float, torch.FloatTensor],
     sample: torch.FloatTensor,
     prev_sample: Optional[torch.FloatTensor] = None,
-    generator: Optional[torch.Generator] = None,
     determistic: bool = False,
     return_pixel_log_prob: bool = False,
     return_dt_and_std_dev_t: bool = False
 ):
     """
-    Predict the sample from the previous timestep by reversing the SDE and compute log-prob.
-    All internal numerical computations are performed in torch.float32 to avoid mixed-precision
-    autograd mismatch on NPU. Inputs that participate in gradient flow are converted using
-    .to(dtype=torch.float32) (not .float()) to preserve autograd links.
+    Predict the sample from the previous timestep by reversing the SDE. This function propagates the flow
+    process from the learned model outputs (most often the predicted velocity).
+
+    Args:
+        model_output (`torch.FloatTensor`):
+            The direct output from learned flow model.
+        timestep (`float`):
+            The current discrete timestep in the diffusion chain.
+        sample (`torch.FloatTensor`):
+            A current instance of a sample created by the diffusion process.
     """
-    # Ensure inputs used for math are float32 (preserve grad where needed)
-    device = sample.device
 
-    # Convert model_output, sample, prev_sample to float32 (preserves requires_grad)
-    model_output = model_output.to(dtype=torch.float32, device=device)
-    sample = sample.to(dtype=torch.float32, device=device)
+
+    # print("model_output.dtype", model_output.dtype)
+    # print("sample.dtype", sample.dtype)
+    # print("prev_sample.dtype", prev_sample.dtype)
+    # print("timestep.dtype", timestep.dtype)
+
+
+    # prev_sample_mean, we must convert all variable to fp32
+    model_output=model_output.float()
+    sample=sample.float()
     if prev_sample is not None:
-        prev_sample = prev_sample.to(dtype=torch.float32, device=device)
+        prev_sample=prev_sample.float()
+        
+    step_index = [self.index_for_timestep(t) for t in timestep]
+    prev_step_index = [step+1 for step in step_index]
 
-    # timestep may be tensor (batch) or scalar; convert to CPU tensor for index_for_timestep usage
-    # but keep original dtype for subsequent computations
-    if isinstance(timestep, torch.Tensor):
-        timestep_cpu = timestep.detach().cpu()
-    else:
-        timestep_cpu = torch.tensor(timestep)
-
-    # Compute step indices using scheduler helper
-    step_index = [self.index_for_timestep(t) for t in timestep_cpu]
-    prev_step_index = [step + 1 for step in step_index]
-
-    # Force sigmas to float32 on correct device
-    self.sigmas = self.sigmas.to(device=device, dtype=torch.float32)
-    sigma = self.sigmas[step_index].view(-1, 1, 1, 1, 1)        # shape: [B,1,1,1,1]
+    self.sigmas = self.sigmas.to(sample.device)
+    sigma = self.sigmas[step_index].view(-1, 1, 1, 1, 1)
     sigma_prev = self.sigmas[prev_step_index].view(-1, 1, 1, 1, 1)
-
-    # Use float32 scalars/tensors for all constants
-    sigma_max_tensor = self.sigmas[1].to(dtype=torch.float32, device=device)
-    sigma_min_tensor = self.sigmas[-1].to(dtype=torch.float32, device=device)
+    sigma_max = self.sigmas[1].item()
+    sigma_min = self.sigmas[-1].item()
     dt = sigma_prev - sigma
 
-    # std_dev_t uses broadcasting; result float32
-    std_dev_t = sigma_min_tensor + (sigma_max_tensor - sigma_min_tensor) * sigma
+    std_dev_t = sigma_min + (sigma_max - sigma_min) * sigma
+    prev_sample_mean = sample*(1+std_dev_t**2/(2*sigma)*dt)+model_output*(1+std_dev_t**2*(1-sigma)/(2*sigma))*dt
 
-    # define constants on correct device / dtype (float32)
-    two = torch.tensor(2.0, dtype=torch.float32, device=device)
-    one = torch.tensor(1.0, dtype=torch.float32, device=device)
-    neg_one = torch.tensor(-1.0, dtype=torch.float32, device=device)
-    pi_tensor = torch.tensor(math.pi, dtype=torch.float32, device=device)
-
-    # prev_sample_mean: keep as float32 and ensure autograd is preserved
-    prev_sample_mean = (
-        sample * (one + std_dev_t ** 2 / (two * sigma) * dt)
-        + model_output * (one + std_dev_t ** 2 * (one - sigma) / (two * sigma)) * dt
-    )
-
-    if prev_sample is not None and generator is not None:
-        raise ValueError(
-            "Cannot pass both generator and prev_sample. Please make sure that either `generator` or"
-            " `prev_sample` stays `None`."
-        )
 
     if prev_sample is None:
         variance_noise = randn_tensor(
             model_output.shape,
-            generator=generator,
-            device=device,
-            dtype=torch.float32,
+            device=model_output.device,
+            dtype=model_output.dtype,
         )
-        prev_sample = prev_sample_mean + std_dev_t * torch.sqrt(neg_one * dt) * variance_noise
+        prev_sample = prev_sample_mean + std_dev_t * torch.sqrt(-1*dt) * variance_noise
 
-    # No noise is added during deterministic evaluation
+    # No noise is added during evaluation
     if determistic:
         prev_sample = sample + dt * model_output
 
-    # Compute log_prob in float32. Use detach on prev_sample if you want to treat it as observed;
-    # we keep prev_sample.detach() in the quadratic term to match previous probabilistic interpretation.
-    log_2pi_sqrt = torch.log(torch.sqrt(two * pi_tensor))
-
-    sqrt_neg_dt = torch.sqrt(neg_one * dt)  # float32
-    var_term = (std_dev_t * sqrt_neg_dt) ** 2  # float32 variance
-    # We use prev_sample.detach() so log_prob models likeliehood of observed prev_sample (no grad w.r.t prev_sample)
     log_prob = (
-        -((prev_sample.detach() - prev_sample_mean) ** 2) / (two * var_term)
-        - torch.log(std_dev_t * sqrt_neg_dt)
-        - log_2pi_sqrt
+        -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * ((std_dev_t * torch.sqrt(-1*dt))**2))
+        - torch.log(std_dev_t * torch.sqrt(-1*dt))
+        - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi, dtype=torch.float32)))
     )
 
-    # reduce mean across non-batch dims
+    # mean along all but batch dimension
     log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
-
+        
     if return_dt_and_std_dev_t:
-        # All outputs are float32
-        return prev_sample, log_prob, prev_sample_mean, std_dev_t, sqrt_neg_dt
+        return prev_sample, log_prob, prev_sample_mean, std_dev_t, torch.sqrt(-1*dt)
+    return prev_sample, log_prob, prev_sample_mean, std_dev_t * torch.sqrt(-1*dt)
 
-    # return std_dev_t * sqrt_neg_dt as float32 to be used later
-    return prev_sample, log_prob, prev_sample_mean, std_dev_t * sqrt_neg_dt
-
-    
 def wan_pipeline_with_logprob(
     self,
     prompt: Union[str, List[str]] = None,

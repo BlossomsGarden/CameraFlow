@@ -6,77 +6,63 @@ import torch_npu
 from collections import defaultdict
 from tqdm.auto import tqdm
 
-def jpeg_incompressibility():
-    def _fn(images, prompts):
-        if isinstance(images, torch.Tensor):
-            images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
-            images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
-        images = [Image.fromarray(image) for image in images]
-        buffers = [io.BytesIO() for _ in images]
-        for image, buffer in zip(images, buffers):
-            image.save(buffer, format="JPEG", quality=95)
-        sizes = [buffer.tell() / 1000 for buffer in buffers]
-        return np.array(sizes), {}
 
-    return _fn
+def _release_modules(*modules):
+    """
+    Move heavy modules back to CPU and clear accelerator caches so we only keep
+    VRAM usage while a reward is actively being computed.
+    """
+    for module in modules:
+        if module is None:
+            continue
+        try:
+            move_fn = getattr(module, "to", None)
+            if callable(move_fn):
+                move_fn("cpu")
+        except Exception:
+            pass
+        finally:
+            del module
 
-
-def jpeg_compressibility():
-    jpeg_fn = jpeg_incompressibility()
-
-    def _fn(images, prompts):
-        rew, meta = jpeg_fn(images, prompts)
-        return -rew/500, meta
-
-    return _fn
-
-
-def aesthetic_score():
-    from flow_grpo.aesthetic_scorer import AestheticScorer
-
-    scorer = AestheticScorer(dtype=torch.bfloat16).npu()
-
-    def _fn(images, prompts):
-        if isinstance(images, torch.Tensor):
-            images = (images * 255).round().clamp(0, 255).to(torch.uint8)
-        else:
-            images = images.transpose(0, 3, 1, 2)  # NHWC -> NCHW
-            images = torch.tensor(images, dtype=torch.uint8)
-        scores = scorer(images)
-        return scores, {}
-
-    return _fn
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.empty_cache()
 
 
 def imagereward_score(device):
     from flow_grpo.imagereward_scorer import ImageRewardScorer
 
-    scorer = ImageRewardScorer(dtype=torch.float32, device=device)
-
     def _fn(images, prompts):
-        if isinstance(images, torch.Tensor):
-            images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
-            images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
-            images = [Image.fromarray(image) for image in images]
-        prompts = [prompt for prompt in prompts]
-        scores = scorer(prompts, images)
-        return scores, {}
+        scorer = ImageRewardScorer(dtype=torch.float32, device=device)
+        try:
+            if isinstance(images, torch.Tensor):
+                images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+                images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
+                images = [Image.fromarray(image) for image in images]
+            prompts = [prompt for prompt in prompts]
+            scores = scorer(prompts, images)
+            return scores, {}
+        finally:
+            _release_modules(scorer)
 
     return _fn
 
 def qwenvl_score(device):
     from flow_grpo.qwenvl import QwenVLScorer
 
-    scorer = QwenVLScorer(dtype=torch.bfloat16, device=device)
-
     def _fn(images, prompts):
-        if isinstance(images, torch.Tensor):
-            images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
-            images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
-            images = [Image.fromarray(image) for image in images]
-        prompts = [prompt for prompt in prompts]
-        scores = scorer(prompts, images)
-        return scores, {}
+        scorer = QwenVLScorer(dtype=torch.bfloat16, device=device)
+        try:
+            if isinstance(images, torch.Tensor):
+                images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+                images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
+                images = [Image.fromarray(image) for image in images]
+            prompts = [prompt for prompt in prompts]
+            scores = scorer(prompts, images)
+            return scores, {}
+        finally:
+            _release_modules(scorer)
 
     return _fn
 
@@ -215,18 +201,21 @@ def unifiedreward_score_sglang(device):
 def video_ocr_score(device):
     from flow_grpo.ocr import OcrScorer_video_or_image
 
-    scorer = OcrScorer_video_or_image()
-
     def _fn(images, prompts):
-        if isinstance(images, torch.Tensor):
-            if images.dim() == 4 and images.shape[1] == 3:
-                images = images.permute(0, 2, 3, 1) 
-            elif images.dim() == 5 and images.shape[2] == 3:
-                images = images.permute(0, 1, 3, 4, 2)
-            images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
-        scores = scorer(images, prompts)
-        # change tensor to list
-        return scores, {}
+        scorer = OcrScorer_video_or_image()
+        try:
+            if isinstance(images, torch.Tensor):
+                if images.dim() == 4 and images.shape[1] == 3:
+                    images = images.permute(0, 2, 3, 1) 
+                elif images.dim() == 5 and images.shape[2] == 3:
+                    images = images.permute(0, 1, 3, 4, 2)
+                images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+            scores = scorer(images, prompts)
+            # change tensor to list
+            return scores, {}
+        finally:
+            scorer_module = getattr(scorer, "model", None)
+            _release_modules(scorer_module)
 
     return _fn
 
@@ -279,12 +268,7 @@ def gt_reward(device):
         # VGG backbone expects float32 tensors and tensors on the same device as the model
         output_video = output_video.float()
         gt_video = gt_video.float()
-        # print("="*100)
-        # print("output_video.device", output_video.device)
-        # print("gt_video.device", gt_video.device)
-        # print("device", device)
-        # print("="*100)
-
+        
         # Ensure input format is torch.Tensor in [0,1], shape: (B, C, T, H, W)
         # Optional: normalize to [0,1] if looks unnormalized
         if output_video.max() > 1.1:
@@ -323,10 +307,9 @@ def gt_reward(device):
 
             return ssim_map.mean(dim=(1, 2, 3))  # (N,)
 
-        print("SSIM start")
-        print("output_video.device", output_video.device)
-        print("gt_video.device", gt_video.device)
-        print("device", device)
+        # print("output_video.device", output_video.device)
+        # print("gt_video.device", gt_video.device)
+        # print("device", device)
         vggp = VGGPerceptual(device)
         B, C, T, H, W = output_video.shape
         out_flat = output_video.permute(0, 2, 1, 3, 4).reshape(B*T, C, H, W)
@@ -334,9 +317,7 @@ def gt_reward(device):
         ssim_frame = ssim_torch(out_flat, gt_flat, channel=C)    # (B*T,)
         # Use torch mean directly to avoid numpy dispatch issues on tensors
         mean_ssim = ssim_frame.mean().item()
-        print("SSIM end")
-
-        print("LPIPS start")
+        
         # Ensure LPIPS network is on the correct device as well
         lpips_values = []
         for b in range(B):
@@ -362,17 +343,118 @@ Video Quality————
     CLIP-F
     CLIP-V
 """
-def clip_score():
+def clip_score(device):
+    """
+    Returns a unified CLIP-based reward for video generation, integrating CLIP-T (text-image), 
+    CLIP-F (intra-video frame), and CLIP-V (source-target aligned frame) criteria into 
+    a numerically bounded, differentiable, and theoretically justified reward for RL.
+
+    The unified CLIP reward is a weighted sum of:
+        - clip_t: CLIP text-image similarity (mean over frames/batch)
+        - clip_f: Average cosine similarity between consecutive frame embeddings
+        - clip_v: Cosine similarity between ground truth and generated corresponding frames
+
+    All components are normalized and combined to produce a reward in [0, 1], 
+    facilitating effective and stable RL training.
+
+    Usage: score = clip_score(device)(output_video, gt_video, prompts)
+    Returns: scalar reward (float), with a dictionary of individual sub-scores.
+    """
+    import torch
+    import torch.nn.functional as F
+    import numpy as np
     from flow_grpo.clip_scorer import ClipScorer
 
-    scorer = ClipScorer(dtype=torch.float32).npu()
+    # Weighting: these should be validated for task/research, here uniform; adjust as needed.
+    W_T, W_F, W_V = 0.4, 0.2, 0.4
 
-    def _fn(images, prompts):
-        if not isinstance(images, torch.Tensor):
-            images = images.transpose(0, 3, 1, 2)  # NHWC -> NCHW
-            images = torch.tensor(images, dtype=torch.uint8)/255.0
-        scores = scorer(images, prompts)
-        return scores, {}
+    def _fn(output_video, gt_video, prompts):
+        scorer = ClipScorer(device=device)
+        try:
+            # output_video, gt_video: [B, C, T, H, W], float32, [0,1] or [0,255]
+            output_video = output_video.to(device)
+            gt_video = gt_video.to(device)
+            B, C, T, H, W = output_video.shape
+
+            clip_t_list = []
+            clip_f_list = []
+            clip_v_list = []
+
+            for b in range(B):
+                # ------ CLIP-T ------
+                frames = output_video[b]  # [C, T, H, W]
+                prompt = prompts[b] if isinstance(prompts, (list, tuple)) else prompts
+                frames_t_first = frames.permute(1, 0, 2, 3)  # [T, C, H, W]
+                frame_scores = scorer(pixels=frames_t_first, prompts=prompt)  # [T]
+                if isinstance(frame_scores, torch.Tensor):
+                    clip_t_list.append(torch.mean(frame_scores).item())
+                else:
+                    clip_t_list.append(float(np.mean(frame_scores)))
+
+                # ------ CLIP-F ------
+                if T < 2:
+                    clip_f_list.append(0.0)
+                else:
+                    with torch.no_grad():
+                        processed_frames = scorer._process(frames_t_first).to(device)  # [T, C, H, W]
+                        features = scorer.model.get_image_features(pixel_values=processed_frames)  # [T, D]
+                        features = F.normalize(features, p=2, dim=1)
+                        similarities = F.cosine_similarity(features[:-1], features[1:], dim=1)  # [T-1]
+                        clip_f_list.append(similarities.mean().item())
+
+                # ------ CLIP-V ------
+                src_frames = gt_video[b]
+                tgt_frames = output_video[b]
+                min_frames = min(src_frames.shape[1], tgt_frames.shape[1])
+                if min_frames == 0:
+                    clip_v_list.append(0.0)
+                else:
+                    src_frames_ = src_frames[:, :min_frames, :, :]  # [C, min_frames, H, W]
+                    tgt_frames_ = tgt_frames[:, :min_frames, :, :]  # [C, min_frames, H, W]
+                    src_frames_ = src_frames_.permute(1, 0, 2, 3)  # [min_frames, C, H, W]
+                    tgt_frames_ = tgt_frames_.permute(1, 0, 2, 3)
+                    with torch.no_grad():
+                        src_processed = scorer._process(src_frames_).to(device)
+                        tgt_processed = scorer._process(tgt_frames_).to(device)
+                        src_feat = scorer.model.get_image_features(pixel_values=src_processed)
+                        tgt_feat = scorer.model.get_image_features(pixel_values=tgt_processed)
+                        src_feat = F.normalize(src_feat, p=2, dim=1)
+                        tgt_feat = F.normalize(tgt_feat, p=2, dim=1)
+                        similarities = F.cosine_similarity(src_feat, tgt_feat, dim=1)  # [min_frames]
+                        clip_v_list.append(similarities.mean().item())
+
+            # Normalization
+            # [B] array
+            clip_t_arr = torch.tensor(clip_t_list, dtype=torch.float32)
+            clip_f_arr = torch.tensor(clip_f_list, dtype=torch.float32)
+            clip_v_arr = torch.tensor(clip_v_list, dtype=torch.float32)
+
+            # 1. CLIP-T: sigmoid映射到[0,1]
+            norm_clip_t = torch.sigmoid(clip_t_arr)
+            # 2. CLIP-F, CLIP-V: [-1,1] -> [0,1]
+            norm_clip_f = (clip_f_arr + 1.0) / 2.0
+            norm_clip_v = (clip_v_arr + 1.0) / 2.0
+
+            # 合成unified reward
+            clip_reward = W_T * norm_clip_t + W_F * norm_clip_f + W_V * norm_clip_v
+            clip_reward = clip_reward.clamp(0.0, 1.0)  # [B]
+
+            # 返回[B, 1]，与gt_reward一致
+            clip_reward = clip_reward.view(-1, 1)  # [B, 1]
+
+            # # 打印shape确认
+            # print("="*100)
+            # print("norm_clip_t", norm_clip_t)
+            # print("norm_clip_f", norm_clip_f)
+            # print("norm_clip_v", norm_clip_v)
+            # print("clip_reward", clip_reward)
+            # print("clip_reward.shape", clip_reward.shape)
+            # print("="*100)
+
+            # 如果需要numpy输出，可: return clip_reward.cpu().numpy()
+            return clip_reward
+        finally:
+            _release_modules(scorer)
 
     return _fn
 
@@ -380,15 +462,43 @@ def clip_score():
 def pickscore_score(device):
     from flow_grpo.pickscore_scorer import PickScoreScorer
 
-    scorer = PickScoreScorer(dtype=torch.float32, device=device)
+    def _fn(output_video, gt_video, prompts):
+        scorer = PickScoreScorer(dtype=torch.float32, device=device)
+        try:
+            # 参照gt_reward，处理B, C, T, H, W视频输入
+            B, C, T, H, W = output_video.shape
+            output_video = output_video.to(device)
 
-    def _fn(images, prompts):
-        if isinstance(images, torch.Tensor):
-            images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
-            images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
-            images = [Image.fromarray(image) for image in images]
-        scores = scorer(prompts, images)
-        return scores, {}
+            # 取3帧分别做PickScore，取均值
+            frame_indices = [0, min(35, T-1), min(70, T-1)]
+            frame_indices = sorted(set(frame_indices))  # 去重并排序，防止帧数不足时重复
+            
+            # Handle prompts: if single string, repeat for batch
+            if isinstance(prompts, str):
+                prompt_list = [prompts] * B
+            elif isinstance(prompts, (list, tuple)):
+                prompt_list = prompts
+            else:
+                prompt_list = [prompts] * B
+
+            # 收集所有帧的分数
+            frame_scores_list = []
+            for idx in frame_indices:
+                frames = output_video[:, :, idx, :, :]  # [B, C, H, W]
+                scores = scorer(prompt=prompt_list, images=frames)  # Returns tensor [B]
+                if isinstance(scores, torch.Tensor):
+                    frame_scores_list.append(scores)
+                else:
+                    frame_scores_list.append(torch.tensor(scores, device=device))
+
+            # 对多帧分数取均值: [num_frames, B] -> [B]
+            frame_scores = torch.stack(frame_scores_list, dim=0)  # [num_frames, B]
+            scores = frame_scores.mean(dim=0)  # [B]
+            
+            # 返回列表格式，与gt_reward一致
+            return scores.cpu().tolist()
+        finally:
+            _release_modules(scorer)
 
     return _fn
 
@@ -397,12 +507,10 @@ def multi_score(device, score_dict):
     score_functions = {
         "video_ocr": video_ocr_score,
         "imagereward": imagereward_score,
-        "pickscore": pickscore_score,
         "qwenvl": qwenvl_score,
-        "aesthetic": aesthetic_score,
-        "jpeg_compressibility": jpeg_compressibility,
         "unifiedreward": unifiedreward_score_sglang,
-        "clipscore": clip_score,
+        "clip_score": clip_score,
+        "pick_score": pickscore_score,
         "my_reward": my_reward,
         "optical_reward": optical_reward,
         "gt_reward": gt_reward,
@@ -415,7 +523,9 @@ def multi_score(device, score_dict):
     def _fn(output_video, gt_video, prompts):
         total_scores = []
         score_details = {}
-
+        print("="*100)
+        print("device", device)
+        print("="*100)
         score_items = list(score_dict.items())
         for score_name, weight in tqdm(
             score_items,
@@ -423,17 +533,11 @@ def multi_score(device, score_dict):
             total=len(score_items),
             leave=False,
             dynamic_ncols=True,
-        ):
-            if score_name in ("optical_reward", "gt_reward"):
-                # Move to evaluation device temporarily
-                print("当前计算的奖励是：", score_name)
-                print("传入的类型output_video.device", output_video.device)
-                print("传入的类型gt_video.device", gt_video.device)
-                scores = score_fns[score_name](output_video, gt_video, prompts)
-            else:
-                # CPU-friendly scorers (most convert to numpy/PIL internally)
-                scores = score_fns[score_name](output_video, gt_video, prompts)
-
+        ):  
+            # print("当前计算的奖励是：", score_name)
+            # print("传入的类型output_video.device", output_video.device)
+            # print("传入的类型gt_video.device", gt_video.device)
+            scores = score_fns[score_name](output_video, gt_video, prompts)
             score_details[score_name] = scores
             weighted_scores = [weight * score for score in scores]
             

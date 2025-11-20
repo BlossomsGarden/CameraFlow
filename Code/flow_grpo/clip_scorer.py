@@ -9,6 +9,8 @@ from transformers import AutoImageProcessor,CLIPProcessor, CLIPModel
 import numpy as np
 from PIL import Image
 
+
+
 def get_size(size):
     if isinstance(size, int):
         return (size, size)
@@ -19,6 +21,8 @@ def get_size(size):
     else:
         raise ValueError(f"Invalid size: {size}")
     
+
+
 def get_image_transform(processor:AutoImageProcessor):
     config = processor.to_dict()
     resize = T.Resize(get_size(config.get("size"))) if config.get("do_resize") else nn.Identity()
@@ -26,6 +30,8 @@ def get_image_transform(processor:AutoImageProcessor):
     normalise = T.Normalize(mean=processor.image_mean, std=processor.image_std) if config.get("do_normalize") else nn.Identity()
 
     return T.Compose([resize, crop, normalise])
+
+
 
 class ClipScorer(torch.nn.Module):
     def __init__(self, device):
@@ -36,21 +42,106 @@ class ClipScorer(torch.nn.Module):
         self.tform = get_image_transform(self.processor.image_processor)
         self.eval()
     
-    def _process(self, pixels):
-        dtype = pixels.dtype
-        pixels = self.tform(pixels)
-        pixels = pixels.to(dtype=dtype)
+    def preprocess_val(self, image):
+        """Convert a PIL Image to a tensor for processing. For backward compatibility only."""
+        if isinstance(image, Image.Image):
+            image_array = np.array(image)
+            if len(image_array.shape) == 3:  # HWC
+                image_array = image_array.transpose(2, 0, 1)  # CHW
+            elif len(image_array.shape) == 2:  # Grayscale
+                image_array = np.stack([image_array] * 3, axis=0)  # CHW
+            if image_array.dtype == np.uint8:
+                image_array = image_array.astype(np.float32) / 255.0
+            else:
+                image_array = image_array.astype(np.float32)
+            return torch.from_numpy(image_array)
+        return image
 
+    def _process_tensor(self, pixels):
+        """
+        Process tensor directly: (B, C, H, W) or (C, H, W) or (B, C, T, H, W)
+        pixels: float32 in [0, 1] or uint8 in [0, 255]
+        Returns: (B, C, H, W) tensor ready for CLIP
+        """
+        if not isinstance(pixels, torch.Tensor):
+            raise TypeError(f"Expected tensor, got {type(pixels)}")
+        
+        # Handle (B, C, T, H, W) - reshape to (B*T, C, H, W)
+        if len(pixels.shape) == 5:
+            B, C, T, H, W = pixels.shape
+            pixels = pixels.permute(0, 2, 1, 3, 4).contiguous()  # (B, T, C, H, W)
+            pixels = pixels.view(B * T, C, H, W)  # (B*T, C, H, W)
+        
+        # Ensure (B, C, H, W) format
+        if len(pixels.shape) == 3:
+            pixels = pixels.unsqueeze(0)  # (C, H, W) -> (1, C, H, W)
+        
+        # Normalize to [0, 1] if needed
+        if pixels.dtype == torch.uint8:
+            pixels = pixels.float() / 255.0
+        elif pixels.max() > 1.1:
+            pixels = pixels / 255.0
+        
+        # Ensure float32
+        pixels = pixels.float()
+        
+        # Apply transforms (resize, crop, normalize)
+        pixels = self.tform(pixels)
+        
         return pixels
+
+    def _process(self, pixels):
+        """
+        Process input: supports tensor (B, C, H, W) or (B, C, T, H, W), PIL Images, or list of PIL Images
+        """
+        # Handle tensor directly (preferred path)
+        if isinstance(pixels, torch.Tensor):
+            return self._process_tensor(pixels)
+        
+        # Handle PIL Images (backward compatibility)
+        if isinstance(pixels, Image.Image):
+            pixels = self.preprocess_val(pixels).unsqueeze(0)
+            return self._process_tensor(pixels)
+        
+        if isinstance(pixels, list):
+            # Convert list of PIL Images to tensor
+            tensors = [self.preprocess_val(img) if isinstance(img, Image.Image) else img for img in pixels]
+            return self._process_tensor(torch.stack(tensors, dim=0))
+        
+        raise TypeError(f"Expected tensor, PIL Image, or list, got {type(pixels)}")
 
     @torch.no_grad()
     def __call__(self, pixels, prompts, return_img_embedding=False):
-        texts = self.processor(text=prompts, padding='max_length', truncation=True, return_tensors="pt").to(self.device)
-        pixels = self._process(pixels).to(self.device)
-        outputs = self.model(pixel_values=pixels, **texts)
+        # Process pixels first to determine batch size
+        pixels_processed = self._process(pixels)
+        num_images = pixels_processed.shape[0] if len(pixels_processed.shape) > 0 else 1
+        
+        # Handle prompts: if single string and multiple images, repeat the prompt
+        if isinstance(prompts, str):
+            # Single prompt for potentially multiple images
+            prompts_list = [prompts] * num_images
+        elif isinstance(prompts, (list, tuple)) and len(prompts) == 1 and num_images > 1:
+            # Single prompt in a list for multiple images
+            prompts_list = list(prompts) * num_images
+        else:
+            prompts_list = prompts
+        
+        texts = self.processor(text=prompts_list, padding='max_length', truncation=True, return_tensors="pt").to(self.device)
+        pixels_processed = pixels_processed.to(self.device)
+        outputs = self.model(pixel_values=pixels_processed, **texts)
+        
+        # Get logits: shape is [num_images, num_texts]
+        logits = outputs.logits_per_image / 30
+        # If we have matching number of images and texts, use diagonal
+        # Otherwise, take the first column (single prompt case)
+        if logits.shape[0] == logits.shape[1]:
+            scores = logits.diagonal()
+        else:
+            scores = logits[:, 0]  # Take first text for all images
+        
         if return_img_embedding:
-            return outputs.logits_per_image.diagonal()/30, outputs.image_embeds
-        return outputs.logits_per_image.diagonal()/30
+            return scores, outputs.image_embeds
+        return scores
 
     @torch.no_grad()
     def image_similarity(self, pixels, ref_pixels):

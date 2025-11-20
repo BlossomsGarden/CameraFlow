@@ -380,11 +380,6 @@ def general_ocr_wan2_1():
     config.sample.test_batch_size = 2
 
     config.train.batch_size = config.sample.train_batch_size
-    
-    # Timestep 0: forward → ~36GB 激活值 → backward → 不释放（还需累积）
-    # Timestep 1: forward → 又 ~36GB → backward → 不释放
-    # ...
-    # 累积 10 倍后才会释放 → OOM
     config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch * config.sample.sample_time_per_prompt // 2 if (config.sample.num_batches_per_epoch * config.sample.sample_time_per_prompt) > 1 else 1
     config.train.num_inner_epochs = 1
     config.train.timestep_fraction = 0.99
@@ -425,39 +420,48 @@ def my_recam_8npu():
     config.save_dir = f'logs/{config.run_name}'
     config.mixed_precision = "bf16"
     config.pretrained.wan_model = "/home/ma-user/modelarts/user-job-dir/wlh/Model/Wan-AI/Wan2.1-T2V-1.3B"
-    config.pretrained.recam_model = "/home/ma-user/modelarts/user-job-dir/wlh/Model/recammaster/step10000-Wan2.1.ckpt"
+    config.pretrained.recam_model = "/home/ma-user/modelarts/user-job-dir/wlh/Model/recammaster/step20000-Kling.ckpt"
+    config.allow_tf32 = True
     config.use_lora = True
     config.train.lora_path = None
     config.height = 480
     config.width = 832
     config.num_frames = 81
     config.reward_fn = {
-        "my_reward": 0.3,
-        "optical_reward": 0.1,
-        "gt_reward": 0.6,
+        # "my_reward": 0.3,
+        "clip_score": 0.3,
+        "pick_score": 0.1,
+        "optical_reward": 0.2,
+        "gt_reward": 0.4,
     }
     config.dataset = "/home/ma-user/modelarts/user-job-dir/wlh/Data/MultiCamVideo-Dataset"
     
-    config.sample.train_batch_size = 1  # sample batch size
+    config.sample.train_batch_size = 2  # sample batch size
+    config.sample.test_batch_size = 1   # eval batch size
+
     config.sample.k = 4  
-    config.sample.num_steps = 20        # denoising steps
+    config.sample.num_steps = 30        # sampling denoising steps
     config.sample.eval_num_steps = 50   # SDE inference steps
     config.sample.guidance_scale=5.0    # CFG
     config.sample.num_batches_per_epoch = 2     # 每个epoch里只采样2次batch
 
+    # A large num_epochs is intentionally set here. Training will be manually stopped once sufficient
+    config.num_epochs = 100000
+    config.save_freq = 60 # epoch
+    config.eval_freq = 30
 
-    config.sample.test_batch_size = 2
 
     config.train.batch_size = config.sample.train_batch_size
     config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch // 2 if config.sample.num_batches_per_epoch > 1 else 1
     config.train.num_inner_epochs = 1
-    config.train.timestep_fraction = 0.1
+    config.train.timestep_fraction = 0.5
 
     # Gradient checkpointing: saves memory by recomputing activations during backward pass
     # Enable this to reduce memory usage by 50-70% at the cost of ~30% slower training
     # Optional: offload checkpoints to CPU for even more memory savings (slower but saves more memory)
     config.train.gradient_checkpointing = True
     config.train.gradient_checkpointing_offload = False
+
 
     # kl loss
     config.train.beta = 0.004
@@ -469,10 +473,6 @@ def my_recam_8npu():
     config.sample.global_std=False
     config.train.ema=True
     config.diffusion_loss = True
-    # A large num_epochs is intentionally set here. Training will be manually stopped once sufficient
-    config.num_epochs = 100000
-    config.save_freq = 60 # epoch
-    config.eval_freq = 30
     
 
     config.per_prompt_stat_tracking = True

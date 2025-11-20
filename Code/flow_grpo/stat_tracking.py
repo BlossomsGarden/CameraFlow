@@ -10,11 +10,9 @@ class PerPromptStatTracker:
 
     def update(self, prompts, rewards, type='grpo'):
         prompts = np.array(prompts)
-        # CRITICAL: Ensure float32 dtype from the start to avoid DT_DOUBLE on NPU
         rewards = np.array(rewards, dtype=np.float32)
         unique = np.unique(prompts)
-        # CRITICAL: Ensure advantages is float32, not float64
-        advantages = np.zeros_like(rewards, dtype=np.float32)
+        advantages = np.empty_like(rewards)*0.0
         for prompt in unique:
             prompt_rewards = rewards[prompts == prompt]
             if prompt not in self.stats:
@@ -30,13 +28,13 @@ class PerPromptStatTracker:
             else:
                 std = np.std(self.stats[prompt], axis=0, keepdims=True) + 1e-4
             if type=='grpo':
-                advantages[prompts == prompt] = ((prompt_rewards - mean) / std).astype(np.float32)
+                advantages[prompts == prompt] = (prompt_rewards - mean) / std
             elif type=='rwr':
                 # advantages[prompts == prompt] = (prompt_rewards - mean) / std
-                advantages[prompts == prompt] = prompt_rewards.astype(np.float32)
+                advantages[prompts == prompt] = prompt_rewards
                 # advantages[prompts == prompt] = torch.softmax(torch.tensor(prompt_rewards), dim=0).numpy()
             elif type=='sft':
-                advantages[prompts == prompt] = (torch.tensor(prompt_rewards) == torch.max(torch.tensor(prompt_rewards))).float().numpy().astype(np.float32)
+                advantages[prompts == prompt] = (torch.tensor(prompt_rewards) == torch.max(torch.tensor(prompt_rewards))).float().numpy()
             elif type=='dpo':
                 # Get the advantages of the current prompt
                 prompt_advantages = torch.tensor(prompt_rewards)
@@ -51,11 +49,10 @@ class PerPromptStatTracker:
                 # Set the maximum index to 1, minimum index to -1
                 result[max_idx] = 1.0
                 result[min_idx] = -1.0
-                advantages[prompts == prompt] = result.numpy().astype(np.float32)
+                advantages[prompts == prompt] = result.numpy()
                 # print("reward difference one group", prompt_advantages[max_idx]-prompt_advantages[min_idx])
-        
-        # CRITICAL: Ensure return value is float32 to avoid DT_DOUBLE on NPU
-        return advantages.astype(np.float32)
+            
+        return advantages
 
     def get_stats(self):
         avg_group_size = sum(len(v) for v in self.stats.values()) / len(self.stats) if self.stats else 0

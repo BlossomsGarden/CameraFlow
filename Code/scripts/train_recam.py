@@ -4,8 +4,6 @@ import os
 os.environ["WANDB_MODE"] = "offline"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'DETAIL'
-os.environ["ALLOW_MULTIDEVICE_GRAD_CAST"] = "1"
-os.environ["ALLOW_BF16_GRAD_CAST"] = "1"
 # # 添加以下两行禁用FlashAttention
 # os.environ["USE_FLASH_ATTENTION"] = "0"
 # os.environ["USE_MEMORY_EFFICIENT_ATTENTION"] = "0"
@@ -22,8 +20,8 @@ import hashlib
 import glob
 from typing import Optional
 from absl import app, flags
+# 在文件开头的 imports 部分加入：
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
 from ml_collections import config_flags
 from accelerate.utils import set_seed, ProjectConfiguration
 from accelerate.logging import get_logger
@@ -386,7 +384,6 @@ def compute_log_prob_recam(
     source_latents,
     config,
     negative_prompt_embeds=None,
-    _print_npu_mem=None,
 ):
     """
     Compute log probability for ReCamMaster model with camera embeddings and source video.
@@ -398,9 +395,6 @@ def compute_log_prob_recam(
     target_latents = sample["latents"][:, j]  # (batch_size, C, T, H, W)
     next_latents = sample["next_latents"][:, j]
     timestep = sample["timesteps"][:, j]
-    
-    # if _print_npu_mem:
-    #     _print_npu_mem(f"compute_log_prob_recam: before moving tensors to device")
     
     target_latents_model = target_latents.to(device=device, dtype=model_dtype)
     condition_latents = source_latents.to(device=device, dtype=model_dtype)
@@ -424,13 +418,12 @@ def compute_log_prob_recam(
             use_gradient_checkpointing=use_gc,
             use_gradient_checkpointing_offload=use_gc_offload,
         )
-        
         with torch.no_grad():
             noise_pred_nega = transformer(
                 x=latents_input,
                 timestep=timestep_model,
                 context=negative_prompt_embeds,
-                cam_emb=cam_emb,
+                cam_emb=cam_emb
             )
         noise_pred = noise_pred_nega + config.sample.guidance_scale * (noise_pred_posi - noise_pred_nega)
     else:
@@ -446,7 +439,6 @@ def compute_log_prob_recam(
         )
     
     # Extract only the target (denoised) portion before computing log-prob and scheduler updates
-    noise_pred = noise_pred.to(dtype=torch.float32)
     tgt_latent_length = target_latents_model.shape[2]
     noise_pred_target = noise_pred[:, :, :tgt_latent_length, ...]
     
@@ -456,17 +448,17 @@ def compute_log_prob_recam(
     
     prev_sample, log_prob, prev_sample_mean, std_dev_t = sde_step_with_logprob(
         pipeline.scheduler,
-        noise_pred_target,  # Already float32 if converted above
+        noise_pred_target.float(),
         timestep.to(dtype=torch.float32, device=device),
-        target_latents.to(dtype=torch.float32, device=device),
-        prev_sample=next_latents.to(dtype=torch.float32, device=device),
+        target_latents.float(),
+        prev_sample=next_latents.float(),
     )
     
     # Free large intermediates ASAP to reduce peak memory
     del noise_pred, noise_pred_target, latents_input
-
-    torch.npu.empty_cache()
-    
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
     
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
@@ -528,7 +520,19 @@ def recam_pipeline_with_logprob(
     """
     device = all_latents.device
     # config.sample.train_batch_size
-    batch_size = negative_prompt_embeds.shape[0]
+    # Use batch_size from all_latents to ensure consistency with source_latents
+    # The last batch may not be full batch_size, so we need to use the actual batch size from data
+    batch_size = all_latents.shape[0]
+    # logger.info(f"batch_size from all_latents: {batch_size}, negative_prompt_embeds.shape[0]: {negative_prompt_embeds.shape[0]}")
+    
+    # Ensure prompt embeddings match the actual batch size
+    if prompt_embeds.shape[0] != batch_size:
+        prompt_embeds = prompt_embeds[:batch_size]
+    if negative_prompt_embeds.shape[0] != batch_size:
+        negative_prompt_embeds = negative_prompt_embeds[:batch_size]
+    if target_camera.shape[0] != batch_size:
+        target_camera = target_camera[:batch_size]
+    
     
     # Extract ReCamMaster data: latents (concatenated target+condition) and camera
     source_latents = all_latents[:, :, 21:, ...]  # (batch_size, 16, 21, 60, 104)
@@ -536,7 +540,7 @@ def recam_pipeline_with_logprob(
     
     # Encode source video to latents
     tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
-        
+    
     # Prepare scheduler
     pipeline.scheduler.set_timesteps(num_inference_steps, denoising_strength=1.0, shift=5.0)
     timesteps = pipeline.scheduler.timesteps
@@ -667,147 +671,221 @@ def recam_pipeline_with_logprob(
                 "step": f"{i+1}/{len(timesteps)}"
             })
     
-        # # Save latents cache after denoising loop completes
-        # # 去噪循环完成后保存 latents 缓存
-        # cache_file = f"latents_cache_rank{process_index}_{time.time()}.pth"
-        # torch.save({
-        #     'all_latents': all_latents,
-        #     'all_log_probs': all_log_probs,
-        # }, cache_file)
-        # logger.info(f"[Rank {process_index}] Successfully saved latents cache to {cache_file}")
-    
     # Decode video (both cached and newly generated paths reach here)
     pipeline.load_models_to_device(['vae'])
+    # frames = pipeline.vae.decode(latents.to(dtype=pipeline.torch_dtype), device=device, **tiler_kwargs)
+    # gt_frames = pipeline.vae.decode(target_latents.to(dtype=pipeline.torch_dtype), device=device, **tiler_kwargs)
     videos = pipeline.vae.decode(latents.to(dtype=pipeline.torch_dtype), device=device, **tiler_kwargs)
     gt_videos = pipeline.vae.decode(target_latents.to(dtype=pipeline.torch_dtype), device=device, **tiler_kwargs)
     pipeline.load_models_to_device([])
     
-    # CRITICAL: Ensure videos and gt_videos are on the correct device
-    # VAE decode may return videos on CPU (due to internal .to("cpu") calls),
-    # but we need them on the specified device for consistency with cached versions
     videos = videos.to(device=device)
     gt_videos = gt_videos.to(device=device)
         
     return videos, gt_videos, all_latents, all_log_probs
 
 
-def eval(pipeline, test_dataloader, config, accelerator, global_step, reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters):
+def eval(pipeline, test_dataloader, test_neg_prompt_embed, config, accelerator, global_step, reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters, epoch):
     if config.train.ema:
         ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
-    neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
-
-    sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.test_batch_size, 1, 1)
-    sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.test_batch_size, 1)
 
     # test_dataloader = itertools.islice(test_dataloader, 2)
     all_rewards = defaultdict(list)
+    last_batch_videos = None
+    last_batch_gt_videos = None     # <-- Keep gt_videos for saving
+    last_batch_prompts = None
+    last_batch_rewards = None
+    # last_batch_source_videos = None  # <-- Remove source video variable
+
     for test_batch in tqdm(
         test_dataloader,
         desc="Eval: ",
         disable=not accelerator.is_local_main_process,
         position=0,
     ):
+        # Note: the following print statements referenced all_latents before definition, move them later if needed
+
         prompts, batch_data = test_batch
-        
+
         # Extract ReCamMaster data: latents (concatenated target+condition) and camera
         all_latents = batch_data["latents"].to(accelerator.device)  # (batch_size, 16, 42, 60, 104)
         target_cameras = batch_data["camera"].to(accelerator.device)  # (batch_size, 21, 12)
-        
-        # Split target (gt) and source (condition) latents
-        target_latents = all_latents[:, :, :21, ...]
-        source_latents = all_latents[:, :, 21:, ...]
-        
-        # Decode target/source latents to video for pipeline / reward
-        tiler_kwargs = {"tiled": True, "tile_size": (30, 52), "tile_stride": (15, 26)}
-        with torch.no_grad():
-            source_videos = pipeline.decode_video(source_latents, **tiler_kwargs)
-            if isinstance(source_videos, list):
-                source_videos = torch.stack(source_videos, dim=0)  # (batch_size, C, T, H, W)
-            source_videos = source_videos.to(accelerator.device)
-        
+
+        # Split target (gt) and source (condition) latents for source video decoding (not saved)
+        # source_latents = all_latents[:, :, 21:, ...]  # <-- Not used anymore
+
+        # The following block for decoding source videos is now removed
+
         # Get prompt embeddings from batch_data (already encoded)
-        prompt_embeds = batch_data["prompt_emb"]["context"]  # (batch_size, seq_len, hidden_dim)
-        # For eval, we still compute pooled embeddings from empty prompt for negative prompt
-        pooled_prompt_embeds = None  # Will be handled in pipeline if needed
+        # Remove the second dimension (index 1) to convert (batch_size, 1, seq_len, hidden_dim) -> (batch_size, seq_len, hidden_dim)
+        prompt_embeds = batch_data["prompt_emb"]["context"].squeeze(1).to(accelerator.device)  # (batch_size, seq_len, hidden_dim)
+
         # The last batch may not be full batch_size
-        if len(prompt_embeds)<len(sample_neg_prompt_embeds):
-            sample_neg_prompt_embeds = sample_neg_prompt_embeds[:len(prompt_embeds)]
-            sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds[:len(prompt_embeds)]
+        batch_size = all_latents.shape[0]
+        if batch_size < test_neg_prompt_embed.shape[0]:
+            current_neg_prompt_embeds = test_neg_prompt_embed[:batch_size]
+        else:
+            current_neg_prompt_embeds = test_neg_prompt_embed
+
+        # Generate videos using recam_pipeline_with_logprob (same as sampling)
         with autocast():
             with torch.no_grad():
                 videos, gt_videos, _, _ = recam_pipeline_with_logprob(
-                    pipeline,
+                    pipeline=pipeline,
                     prompt_embeds=prompt_embeds,
-                    negative_prompt_embeds=sample_neg_prompt_embeds,
+                    negative_prompt_embeds=current_neg_prompt_embeds,
                     all_latents=all_latents,
                     target_camera=target_cameras,
                     num_inference_steps=config.sample.eval_num_steps,
                     guidance_scale=config.sample.guidance_scale,
-                    output_type="pt",
+                    output_type="tensor",
                     height=config.height,
                     width=config.width,
                     num_frames=config.num_frames,
-                    tiled=True,
                 )
+
         # Note: reward_fn should handle video input instead of images
-        # Move videos to CPU for reward computation to free device memory; scorers will stage to device if needed
-        videos_cpu = videos.detach().to("cpu")
-        gt_videos_cpu = gt_videos.detach().to("cpu")
-        del videos, gt_videos
-    
-
-
-        rewards = executor.submit(reward_fn, videos_cpu, gt_videos_cpu, prompts)
+        rewards = executor.submit(reward_fn, videos, gt_videos, prompts)
         # yield to to make sure reward computation starts
         time.sleep(0)
         rewards = rewards.result()
 
+        # 关键修复：在gather之前确保所有进程都完成了奖励计算
+        # 这可以防止某些进程在奖励计算上花费更长时间导致其他进程在gather时超时
+        accelerator.wait_for_everyone()
+        
         for key, value in rewards.items():
             rewards_gather = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
             all_rewards[key].append(rewards_gather)
+
+        # Save last batch for video saving
+        last_batch_videos = videos
+        last_batch_gt_videos = gt_videos     # <-- Save gt_videos
+        last_batch_prompts = prompts
+        last_batch_rewards = rewards
+        # last_batch_source_videos = source_videos   # <-- Remove
+
+    # 关键修复：确保所有进程都完成了eval循环，再执行后续的gather操作
+    # 这可以防止某些进程在循环中卡住导致其他进程在gather时超时
+    accelerator.wait_for_everyone()
     
-    last_batch_videos_gather = accelerator.gather(torch.as_tensor(videos, device=accelerator.device)).cpu().numpy()
-    # For prompts, we don't have raw text, so use empty strings or extract from embeddings if possible
-    # Since we have prompt_embeds, we can't easily decode back to text
-    # Use empty prompts for logging purposes
-    last_batch_prompts_gather = [""] * len(last_batch_videos_gather)
+    # Handle case where no batches were processed
+    if last_batch_videos is None:
+        if accelerator.is_main_process:
+            logger.warning("No batches processed in eval, skipping video saving")
+        if config.train.ema:
+            ema.copy_temp_to(transformer_trainable_parameters)
+        return
+
+    # 关键修复：在gather之前再次同步，确保所有进程都到达这里
+    accelerator.wait_for_everyone()
+    
+    last_batch_videos_gather = accelerator.gather(torch.as_tensor(last_batch_videos, device=accelerator.device)).float().cpu().numpy()
+    # last_batch_source_videos_gather = accelerator.gather(torch.as_tensor(last_batch_source_videos, device=accelerator.device)).float().cpu().numpy()  # <-- Remove
+    last_batch_gt_videos_gather = accelerator.gather(torch.as_tensor(last_batch_gt_videos, device=accelerator.device)).float().cpu().numpy()  # <-- Gather gt_videos
+
+    # Gather prompts from all processes
+    # Use gather_object for string lists (requires accelerate >= 0.20.0)
+    # If not available, fall back to manual collection
+    try:
+        last_batch_prompts_gather = accelerator.gather_object(last_batch_prompts if last_batch_prompts else [])
+        if accelerator.is_main_process:
+            # Flatten the list of lists
+            last_batch_prompts_gather = [p for prompt_list in last_batch_prompts_gather for p in prompt_list]
+            # Ensure length matches videos
+            if len(last_batch_prompts_gather) < len(last_batch_videos_gather):
+                last_batch_prompts_gather.extend([""] * (len(last_batch_videos_gather) - len(last_batch_prompts_gather)))
+            elif len(last_batch_prompts_gather) > len(last_batch_videos_gather):
+                last_batch_prompts_gather = last_batch_prompts_gather[:len(last_batch_videos_gather)]
+    except (AttributeError, TypeError):
+        # Fallback: only use prompts from main process
+        if accelerator.is_main_process:
+            last_batch_prompts_gather = last_batch_prompts if last_batch_prompts else [""] * len(last_batch_videos_gather)
+            if len(last_batch_prompts_gather) < len(last_batch_videos_gather):
+                last_batch_prompts_gather.extend([""] * (len(last_batch_videos_gather) - len(last_batch_prompts_gather)))
+        else:
+            last_batch_prompts_gather = []
+
+    # 关键修复：在最后一个gather之前同步，确保所有进程都完成了前面的gather操作
+    accelerator.wait_for_everyone()
+    
     last_batch_rewards_gather = {}
-    for key, value in rewards.items():
+    for key, value in last_batch_rewards.items():
         last_batch_rewards_gather[key] = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
 
     all_rewards = {key: np.concatenate(value) for key, value in all_rewards.items()}
     if accelerator.is_main_process:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            num_samples = min(15, len(last_batch_videos_gather))
-            # sample_indices = random.sample(range(len(videos)), num_samples)
-            sample_indices = range(num_samples)
-            for idx, index in enumerate(sample_indices):
-                # For videos, we might want to save the first frame or create a video file
-                # For now, extract first frame for visualization
-                video = last_batch_videos_gather[index]  # (C, T, H, W)
-                first_frame = video[:, 0, :, :]  # (C, H, W)
-                pil = Image.fromarray(
-                    (first_frame.transpose(1, 2, 0) * 255).astype(np.uint8)
-                )
-                pil = pil.resize((config.height, config.width))
-                pil.save(os.path.join(tmpdir, f"{idx}.jpg"))
-            sampled_prompts = [last_batch_prompts_gather[index] for index in sample_indices]
-            sampled_rewards = [{k: last_batch_rewards_gather[k][index] for k in last_batch_rewards_gather} for index in sample_indices]
-            for key, value in all_rewards.items():
-                print(key, value.shape)
-            wandb.log(
-                {
-                    "eval_images": [
-                        wandb.Image(
-                            os.path.join(tmpdir, f"{idx}.jpg"),
-                            caption=f"{prompt:.1000} | " + " | ".join(f"{k}: {v:.2f}" for k, v in reward.items() if v != -10),
-                        )
-                        for idx, (prompt, reward) in enumerate(zip(sampled_prompts, sampled_rewards))
-                    ],
-                    **{f"eval_reward_{key}": np.mean(value[value != -10]) for key, value in all_rewards.items()},
-                },
-                step=global_step,
-            )
+        # Create eval directory for saving videos - use epoch-based naming
+        eval_dir = os.path.join(config.logdir if hasattr(config, 'logdir') else "./logs", config.run_name if hasattr(config, 'run_name') else "eval", f"epoch {epoch} eval")
+        os.makedirs(eval_dir, exist_ok=True)
+
+        num_samples = min(15, len(last_batch_videos_gather))
+        sample_indices = range(num_samples)
+
+        # Convert videos to numpy frames and save as video files
+        # Convert numpy array back to torch tensor for tensor2video
+        videos_tensor = torch.from_numpy(last_batch_videos_gather).float()
+        # source_videos_tensor = torch.from_numpy(last_batch_source_videos_gather).float()  # <-- Remove
+        gt_videos_tensor = torch.from_numpy(last_batch_gt_videos_gather).float()   # <-- Add gather for gt_videos
+
+        # Check if values are in [0, 1] range (VAE decode output) or [-1, 1] range
+        # tensor2video expects values in [-1, 1] range
+        if videos_tensor.min() >= 0 and videos_tensor.max() <= 1:
+            # Convert [0, 1] -> [-1, 1]
+            videos_tensor = videos_tensor * 2.0 - 1.0
+        # if source_videos_tensor.min() >= 0 and source_videos_tensor.max() <= 1:
+        #     source_videos_tensor = source_videos_tensor * 2.0 - 1.0  # <-- Remove
+        if gt_videos_tensor.min() >= 0 and gt_videos_tensor.max() <= 1:
+            gt_videos_tensor = gt_videos_tensor * 2.0 - 1.0   # <-- Range check & normalization
+
+        for idx, index in enumerate(sample_indices):
+            video = videos_tensor[index]  # (C, T, H, W)
+            # source_video = source_videos_tensor[index]  # (C, T, H, W)   # <-- Remove
+            gt_video = gt_videos_tensor[index]  # (C, T, H, W)
+
+            # Use pipeline's tensor2video method to convert to PIL Images
+            video_frames = pipeline.tensor2video(video)  # List of PIL Images
+            # source_video_frames = pipeline.tensor2video(source_video)  # List of PIL Images  # <-- Remove
+            gt_video_frames = pipeline.tensor2video(gt_video)  # List of PIL Images
+
+            # Save output video
+            output_video_path = os.path.join(eval_dir, f"output_video_{idx}.mp4")
+            save_video(video_frames, output_video_path, fps=20, quality=5)
+
+            # Save gt video
+            gt_video_path = os.path.join(eval_dir, f"gt_video_{idx}.mp4")
+            save_video(gt_video_frames, gt_video_path, fps=20, quality=5)
+
+        # Save reward information as JSON
+        reward_info = []
+        for idx, index in enumerate(sample_indices):
+            prompt = last_batch_prompts_gather[index] if index < len(last_batch_prompts_gather) else ""
+            reward_dict = {k: float(last_batch_rewards_gather[k][index]) for k in last_batch_rewards_gather if index < len(last_batch_rewards_gather[k])}
+            reward_info.append({
+                "sample_idx": idx,
+                "prompt": prompt,
+                "rewards": reward_dict,
+                "output_video_path": f"output_video_{idx}.mp4",
+                # "source_video_path": f"source_video_{idx}.mp4",  # <-- Remove source path from JSON info
+                "gt_video_path": f"gt_video_{idx}.mp4",     # Add gt_video path into JSON info
+            })
+
+        with open(os.path.join(eval_dir, "reward_info.json"), "w", encoding="utf-8") as f:
+            json.dump(reward_info, f, ensure_ascii=False, indent=2)
+
+        # Log reward statistics to wandb (without images)
+        for key, value in all_rewards.items():
+            print(f"eval_reward_{key}: shape={value.shape}, mean={np.mean(value[value != -10])}")
+
+        wandb.log(
+            {
+                **{f"eval_reward_{key}": np.mean(value[value != -10]) for key, value in all_rewards.items()},
+            },
+            step=global_step,
+        )
+
+        logger.info(f"Eval videos saved to {eval_dir}")
+
     if config.train.ema:
         ema.copy_temp_to(transformer_trainable_parameters)
 
@@ -817,15 +895,21 @@ def unwrap_model(model, accelerator):
     return model
 
 def save_ckpt(save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config):
-    save_root = os.path.join(save_dir, "checkpoints", f"checkpoint-{global_step}")
-    save_root_lora = os.path.join(save_root, "lora")
-    os.makedirs(save_root_lora, exist_ok=True)
     if accelerator.is_main_process:
+        save_root = os.path.join(save_dir, "checkpoints", f"checkpoint-{global_step}")
+        save_root_lora = os.path.join(save_root, "lora")
+        os.makedirs(save_root_lora, exist_ok=True)
+        
         if config.train.ema:
             ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
+        
+        # Save the model (LoRA weights)
         unwrap_model(transformer, accelerator).save_pretrained(save_root_lora)
+        
         if config.train.ema:
             ema.copy_temp_to(transformer_trainable_parameters)
+        
+        logger.info(f"Checkpoint saved to {save_root_lora}")
 
 
 def main(_):
@@ -843,18 +927,13 @@ def main(_):
         total_limit=config.num_checkpoint_limit,
     )
 
-    # Configure DDP to handle unused parameters (needed when using torch.no_grad() in CFG)
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    
+    # Set DDP kwargs to handle unused parameters (needed when using CFG with torch.no_grad for negative prompts)
+    # 从而解决不知道为什么 projector 和 cam_encoder 没有梯度的问题
     accelerator = Accelerator(
         log_with="wandb",
         mixed_precision=config.mixed_precision,
         project_config=accelerator_config,
-        # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
-        # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
-        # the total number of optimizer steps to accumulate across.
-        gradient_accumulation_steps=config.train.gradient_accumulation_steps * num_train_timesteps,
-        kwargs_handlers=[ddp_kwargs],
+        gradient_accumulation_steps=config.train.gradient_accumulation_steps * num_train_timesteps
     )
 
     if accelerator.is_main_process:
@@ -887,27 +966,72 @@ def main(_):
     # Clear model_manager after pipeline creation to free memory
     # 创建 pipeline 后清理 model_manager 以释放内存
     del model_manager
+    import gc
+    gc.collect()
+    if torch.cuda.is_available() or hasattr(torch, 'npu'):
+        # Clear cache for both CUDA and NPU
+        if hasattr(torch, 'npu'):
+            torch.npu.empty_cache()
+        else:
+            torch.cuda.empty_cache()
 
 
     # 2. Initialize additional modules introduced in ReCamMaster
-    dim=pipe.dit.blocks[0].self_attn.q.weight.shape[0]
+    # ----- Robust add of cam_encoder and projector: ensure device & dtype match model -----
+    # pick a representative device & dtype from the existing model parameters
+    rep_param = next(pipe.dit.parameters())
+    model_device = rep_param.device
+    model_dtype  = rep_param.dtype
+
+    dim = pipe.dit.blocks[0].self_attn.q.weight.shape[0]
+
     for block in pipe.dit.blocks:
-        block.cam_encoder = nn.Linear(12, dim)
-        block.projector = nn.Linear(dim, dim)
-        block.cam_encoder.weight.data.zero_()
-        block.cam_encoder.bias.data.zero_()
-        block.projector.weight = nn.Parameter(torch.eye(dim))
-        block.projector.bias = nn.Parameter(torch.zeros(dim))
+        # create layers and immediately move to correct device & dtype
+        # This can solve the following error:
+        # # RuntimeError: Expected to have finished reduction in the prior iteration before starting a new one. This error indicates that your module has parameters that were not used in producing loss. You can enable unused parameter detection by passing the keyword argument `find_unused_parameters=True` to `torch.nn.parallel.DistributedDataParallel`, and by 
+        # # making sure all `forward` function outputs participate in calculating loss. 
+        # # If you already have done the above, then the distributed data parallel module wasn't able to locate the output tensors in the return value of your module's `forward` function. Please include the loss function and the structure of the return value of `forward` of your module when reporting this issue (e.g. list, dict, iterable).
+        # # Parameter indices which did not receive grad for rank 0: 8 9 18 19 28 29 38 39 48 49 58 59 68 69 78 79 88 89 98 99 108 109 118 119 128 129 138 139 148 149 158 159 168 169 178 179 188 189 198 199 208 209 218 219 228 229 238 239 248 249 258 259 268 269 278 279 288 289 298 299
+        try:
+            block.cam_encoder = nn.Linear(12, dim, device=model_device, dtype=model_dtype)
+            block.projector   = nn.Linear(dim, dim, device=model_device, dtype=model_dtype)
+        except TypeError:
+            # older torch: create then move and cast
+            block.cam_encoder = nn.Linear(12, dim)
+            block.projector   = nn.Linear(dim, dim)
+            block.cam_encoder.to(device=model_device, dtype=model_dtype)
+            block.projector.to(device=model_device, dtype=model_dtype)
+
+        # initialize weights in-place using proper dtype/device
+        with torch.no_grad():
+            block.cam_encoder.weight.zero_()
+            if block.cam_encoder.bias is not None:
+                block.cam_encoder.bias.zero_()
+            # set projector weight to identity (use .copy_ to preserve dtype/device)
+            eye = torch.eye(dim, device=model_device, dtype=model_dtype)
+            block.projector.weight.copy_(eye)
+            if block.projector.bias is not None:
+                block.projector.bias.zero_()
+    # -------------------------------------------------------------------------------------
 
 
     # 3. Load ReCamMaster checkpoint
     # Load checkpoint to the correct device for each process
     # 为每个进程加载 checkpoint 到正确的设备
     state_dict = torch.load(config.pretrained.recam_model, map_location=accelerator.device)
-    pipe.dit.load_state_dict(state_dict, strict=True)
+    missing, unexpected = pipe.dit.load_state_dict(state_dict, strict=False)
+    if missing:
+        print("load_state_dict missing keys:", missing)
+    if unexpected:
+        print("load_state_dict unexpected keys:", unexpected)
+    
     # Clear state_dict to free memory
     del state_dict
-        
+    gc.collect()
+    if hasattr(torch, 'npu'):
+        torch.npu.empty_cache()
+    elif torch.cuda.is_available():
+        torch.cuda.empty_cache()
     # Don't move to device here - accelerator.prepare() will handle device placement
     # pipe.to("npu")  # Removed - let accelerator handle device placement
     # pipe.to(dtype=torch.bfloat16)  # Will be set after prepare
@@ -940,19 +1064,22 @@ def main(_):
     # WanModel uses SelfAttention and CrossAttention with modules named q, k, v, o
     # The actual module paths are: blocks.{i}.self_attn.{q,k,v,o} and blocks.{i}.cross_attn.{q,k,v,o}
     # PEFT will match any module ending with these names (q, k, v, o)
-    # target_modules = [
-    #     "q",
-    #     "k",
-    #     "v",
-    #     "o",
-    # ]
     target_modules = [
         "self_attn.q",
         "self_attn.k",
         "self_attn.v",
-        # "self_attn.o",
-        "projector"
+        "self_attn.o",
+        "projector",
+        "cam_encoder"
     ]
+    # target_modules = [
+    #     "self_attn.q",
+    #     "self_attn.k",
+    #     "self_attn.v",
+    #     "self_attn.o",
+    #     "projector",
+    #     "cam_encoder"
+    # ]
     if config.train.lora_path:
         pipe.dit = PeftModel.from_pretrained(pipe.dit, config.train.lora_path)
         # After loading with PeftModel.from_pretrained, all parameters have requires_grad set to False. You need to call set_adapter to enable gradients for the adapter parameters.
@@ -967,21 +1094,26 @@ def main(_):
         # get_peft_model() 会为匹配的模块添加 LoRA 适配器，这些适配器参数默认 requires_grad=True
         pipe.dit = get_peft_model(pipe.dit, transformer_lora_config)
         
-    # 此处会收集所有 requires_grad=True 的参数（主要是 LoRA 适配器参数）
-    transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, pipe.dit.parameters()))
+    # 此处会收集所有 requires_grad=True 的参数（主要是 LoRA 适配器参数），并打印它们的名称
+    transformer_trainable_parameters = []
+    # print("Trainable parameters (requires_grad=True):")
+    for name, param in pipe.dit.named_parameters():
+        if param.requires_grad:
+            transformer_trainable_parameters.append(param)
+            # print(f" - {name}")
     
     num_trainable_params = sum(p.numel() for p in transformer_trainable_parameters)
-    print(f"Number of trainable parameter tensors: {len(transformer_trainable_parameters)}")
-    print(f"Total number of trainable parameters: {num_trainable_params:,}")
+    logger.info(f"Number of trainable parameter tensors: {len(transformer_trainable_parameters)}")
+    logger.info(f"Total number of trainable parameters: {num_trainable_params:,}")
 
     # This ema setting affects the previous 20 × 8 = 160 steps on average.
     ema = EMAModuleWrapper(transformer_trainable_parameters, decay=0.9, update_step_interval=8, device=accelerator.device)
     
 
-    # # Enable TF32 for faster training on Ampere GPUs,
-    # # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
-    # if config.allow_tf32:
-    #     torch.backends.cuda.matmul.allow_tf32 = True
+    # Enable TF32 for faster training on Ampere GPUs,
+    # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
+    if config.allow_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
 
 
     # 5. Initialize the optimizer
@@ -1050,6 +1182,7 @@ def main(_):
     )
 
     neg_prompt_embed = pipe.encode_prompt("色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走", positive=False)["context"][0]
+    test_neg_prompt_embed = neg_prompt_embed.repeat(config.sample.test_batch_size, 1, 1)
     sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.train_batch_size, 1, 1)
     train_neg_prompt_embeds = neg_prompt_embed.repeat(config.train.batch_size, 1, 1)
 
@@ -1065,6 +1198,7 @@ def main(_):
     # This will move pipe.dit to the correct device and wrap it for distributed training
     # Note: In distributed training, all processes must reach this point and synchronize
     transformer, optimizer, train_dataloader, test_dataloader = accelerator.prepare(pipe.dit, optimizer, train_dataloader, test_dataloader)
+    
     
     # Set dtype after prepare (accelerator.prepare() may have moved models)
     pipe.dit.to(dtype=torch.bfloat16)
@@ -1091,16 +1225,7 @@ def main(_):
     logger.info(f"  Sample batch size per device = {config.sample.train_batch_size}")
     logger.info(f"  Train batch size per device = {config.train.batch_size}")
     logger.info(f"  Gradient Accumulation steps = {config.train.gradient_accumulation_steps}")
-    
-    # 核心检查现存的方案
-    use_gc = getattr(config.train, "gradient_checkpointing", False)
-    use_gc_offload = getattr(config.train, "gradient_checkpointing_offload", False)
-    logger.info(f"  Gradient Checkpointing = {use_gc}")
-    if use_gc:
-        logger.info(f"  Gradient Checkpointing Offload = {use_gc_offload}")
-        logger.info(f"  ⚡ Memory savings: ~50-70%, Speed cost: ~30% slower")
     logger.info("")
-
     logger.info(f"  Total number of samples per epoch = {samples_per_epoch}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
     logger.info(f"  Number of gradient updates per inner epoch = {samples_per_epoch // total_train_batch_size}")
@@ -1115,22 +1240,13 @@ def main(_):
     train_iter = iter(train_dataloader)
 
     for epoch in range(first_epoch, config.num_epochs):
-        # Small utility to inspect NPU memory
-        def _print_npu_mem(prefix: str):
-            try:
-                if hasattr(torch, "npu") and torch.npu.is_available():
-                    torch.npu.synchronize()
-                    allocated_gb = torch.npu.memory_allocated() / (1024 ** 3)
-                    reserved_gb = torch.npu.memory_reserved() / (1024 ** 3)
-                    print(f"[NPU MEM] {prefix} | allocated={allocated_gb:.2f} GB, reserved={reserved_gb:.2f} GB")
-            except Exception as e:
-                print(f"[NPU MEM] {prefix} | failed to query: {e}")
-        #################### EVAL ####################
-        # pipe.dit.eval()
-        # if epoch % config.eval_freq == 0:
-        #     eval(pipe, test_dataloader, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
-        # if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
-        #     save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
+        ################### EVAL ####################
+        pipe.dit.eval()
+        if epoch % config.eval_freq == 0:
+            eval(pipe, test_dataloader, test_neg_prompt_embed, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters, epoch)
+        if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
+            logger.info(f"Saving checkpoint at epoch {epoch}")
+            save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
 
         # Check if collated samples cache for this epoch already exists; if so, skip sampling
         # Use global process index to avoid filename collisions across nodes
@@ -1140,7 +1256,7 @@ def main(_):
         samples_file = os.path.join(cache_dir, f"samples_rank{process_index}_epoch{epoch}.pth")
         loaded_samples_cache = False
         if os.path.exists(samples_file):
-            print(f"Found existing samples cache at {samples_file}, skipping sampling and going to training.")
+            logger.info(f"Found existing samples cache at {samples_file}, skipping sampling and going to training.")
             loaded_samples_cache = True
 
         #################### SAMPLING ####################
@@ -1150,6 +1266,11 @@ def main(_):
             pipe.scheduler.set_timesteps(config.sample.num_steps, denoising_strength=1.0, shift=5.0)
 
             samples = []
+            # 用于日志记录的videos和gt_videos（只在需要时保存最后一个batch）
+            last_batch_videos_for_log = None
+            last_batch_gt_videos_for_log = None
+            last_batch_prompts_for_log = None
+            
             for i in tqdm(
                 range(config.sample.num_batches_per_epoch),
                 desc=f"Epoch {epoch}: sampling",
@@ -1166,12 +1287,11 @@ def main(_):
                 target_camera = batch_data["camera"].to(accelerator.device)  # (batch_size, 21, 12)
                 # Get prompt embeddings from batch_data (already encoded)
                 # Remove the second dimension (index 1) to convert (batch_size, 1, seq_len, hidden_dim) -> (batch_size, seq_len, hidden_dim)
-                # 去除第二个维度（索引1），将 (batch_size, 1, seq_len, hidden_dim) -> (batch_size, seq_len, hidden_dim)
-                prompt_embeds = batch_data["prompt_emb"]["context"].squeeze(1).to(accelerator.device)  # (batch_size, seq_len, hidden_dim)
+                prompt_embeds = batch_data["prompt_emb"]["context"].squeeze(1).to(accelerator.device)
 
                 
                 # 缓存文件名可用进程id、epoch和batch索引作区分
-                process_index = accelerator.process_index
+                process_index = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
                 cache_dir = config.save_dir if hasattr(config, "save_dir") else "./latents_cache"
                 os.makedirs(cache_dir, exist_ok=True)
                 cache_file = os.path.join(cache_dir, f"latents_cache_rank{process_index}_epoch{epoch}_batch{i}.pth")
@@ -1217,16 +1337,16 @@ def main(_):
                                 num_frames=config.num_frames
                             )
                     
-                    # 1. 保存 videos、latent_trajectory、log_probs 到缓存文件（每个进程/worker独立的文件名）
-                    force_save = True
-                    if force_save or (not os.path.exists(cache_file)):
-                        torch.save({
-                                "videos": videos,
-                                "gt_videos": gt_videos,
-                                "latent_trajectory": latent_trajectory,
-                                "log_probs": log_probs,
-                            }, cache_file)
-                        logger.info(f"[Rank {process_index}] Saved sample cache to {cache_file}")
+                    # # 1. 保存 videos、latent_trajectory、log_probs 到缓存文件（每个进程/worker独立的文件名）
+                    # force_save = True
+                    # if force_save or (not os.path.exists(cache_file)):
+                    #     torch.save({
+                    #             "videos": videos,
+                    #             "gt_videos": gt_videos,
+                    #             "latent_trajectory": latent_trajectory,
+                    #             "log_probs": log_probs,
+                    #         }, cache_file)
+                    #     logger.info(f"[Rank {process_index}] Saved sample cache to {cache_file}")
 
                 # Stack latents/log_probs so downstream code can slice timestep by timestep
                 if isinstance(latent_trajectory, list):
@@ -1256,10 +1376,7 @@ def main(_):
                 # print("="*100)
 
 
-                print("异步任务已提交，等待奖励计算完成...")
-                print("videos.device", videos.device)
-                print("gt_videos.device", gt_videos.device)
-                # 提交异步任务，立即返回Future对象，不阻塞当前线程
+                # 异步奖励计算模式
                 rewards = executor.submit(reward_fn, videos, gt_videos, prompts)
                 time.sleep(0)  # Ensure the reward thread starts executing
 
@@ -1274,6 +1391,25 @@ def main(_):
                     "log_probs": log_probs,                                             # (batch_size, num_steps)
                     "rewards": rewards,                                                 # 异步计算的奖励信号
                 })
+                
+                # 如果需要日志记录，保存最后一个batch的videos和gt_videos
+                if epoch % 10 == 0 and i == config.sample.num_batches_per_epoch - 1:
+                    # 只在需要日志记录时保存最后一个batch的视频（会占用显存）
+                    last_batch_videos_for_log = videos.clone().detach() if videos is not None else None
+                    last_batch_gt_videos_for_log = gt_videos.clone().detach() if gt_videos is not None else None
+                    last_batch_prompts_for_log = prompts.copy() if prompts is not None else None
+                
+                # 清理当前batch的中间变量
+                # 注意：videos和gt_videos会被异步奖励函数使用，但它们在下一个batch会被覆盖
+                # 为了释放显存，我们可以在奖励提交后立即清理（但它们可能还在被使用）
+                # 由于使用了异步执行器，videos和gt_videos的引用会被复制到奖励计算任务中
+                # 所以这里可以安全地删除（如果不需要日志记录的话）
+                if not (epoch % 10 == 0 and i == config.sample.num_batches_per_epoch - 1):
+                    # 如果不是最后一个batch或不需要日志记录，立即清理videos和gt_videos
+                    del videos, gt_videos
+                
+                # 清理其他中间变量
+                del latent_trajectory, log_probs, timesteps, all_latents, target_camera, prompt_embeds
 
             # wait for all rewards to be computed
             # 阶段2：等待所有任务完成（阻塞等待）
@@ -1281,18 +1417,21 @@ def main(_):
             # 需要存储所有中间状态，内存占用会很高
             # 异步模式：
             # 生成完立即释放相关资源，只存储最终的奖励结果
-            for sample in tqdm(
+            for sample_idx, sample in enumerate(tqdm(
                 samples,
                 desc="Waiting for rewards",
                 disable=not accelerator.is_local_main_process,
                 position=0,
-            ):
+            )):
                 rewards = sample["rewards"].result()
                 sample["rewards"] = {
                     key: torch.as_tensor(value, device=accelerator.device).float()
                     for key, value in rewards.items()
                 }
-                print("sample['rewards']", sample["rewards"])
+                logger.info("sample['rewards']", sample["rewards"])
+
+            # 关键修复：确保所有进程都完成了奖励计算，再执行后续操作
+            accelerator.wait_for_everyone()
 
             # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
             samples = {
@@ -1305,17 +1444,17 @@ def main(_):
                 for k in samples[0].keys()
             }
 
-            if epoch % 10 == 0 and accelerator.is_main_process:
+            # 日志记录（使用保存的最后一个batch的视频）
+            if epoch % 10 == 0 and accelerator.is_main_process and last_batch_videos_for_log is not None:
                 # Log sample videos
                 log_dir = f"./logs/{epoch}/"
                 os.makedirs(log_dir, exist_ok=True)
                 
-                frames = pipe.tensor2video(videos)
-                gt_frames = pipe.tensor2video(gt_videos)
+                frames = pipe.tensor2video(last_batch_videos_for_log)
+                gt_frames = pipe.tensor2video(last_batch_gt_videos_for_log)
 
-                num_samples = min(15, len(videos))
-                sample_indices = random.sample(range(len(videos)), num_samples)
-                video_filenames = []
+                num_samples = min(15, len(last_batch_videos_for_log))
+                sample_indices = random.sample(range(len(last_batch_videos_for_log)), num_samples)
                 reward_infos = []
 
                 for idx, i in enumerate(sample_indices):
@@ -1323,8 +1462,15 @@ def main(_):
                     save_video(frames[i], os.path.join(log_dir, f"{idx}.mp4"), fps=20, quality=5)
                     save_video(gt_frames[i], os.path.join(log_dir, f"{idx}_gt.mp4"), fps=20, quality=5)
 
-                    prompt_str = prompts[i] if i < len(prompts) else ""
-                    avg_reward = samples["rewards"]["avg"][i].item() if "rewards" in samples and i < len(samples["rewards"]["avg"]) else 0.0
+                    prompt_str = last_batch_prompts_for_log[i] if last_batch_prompts_for_log and i < len(last_batch_prompts_for_log) else ""
+                    # 注意：这里使用的reward索引可能与videos索引不对应（因为videos是最后一个batch的）
+                    # 为了正确获取reward，我们需要知道最后一个batch在samples中的起始索引
+                    avg_reward = 0.0  # 无法准确获取对应的reward，设为0
+                    if "rewards" in samples and len(samples["rewards"]["avg"]) > 0:
+                        # 假设最后一个batch在samples的最后
+                        last_batch_start_idx = len(samples["rewards"]["avg"]) - len(last_batch_videos_for_log)
+                        if 0 <= last_batch_start_idx + i < len(samples["rewards"]["avg"]):
+                            avg_reward = samples["rewards"]["avg"][last_batch_start_idx + i].item()
                     reward_infos.append({
                         "filename": os.path.join(log_dir, f"{idx}.mp4"),
                         "prompt": prompt_str,
@@ -1332,20 +1478,23 @@ def main(_):
                     })
 
                 # Save reward info as JSON
-                with open(os.path.join(log_dir, f"reward_{idx}.json"), "w", encoding="utf-8") as f:
+                with open(os.path.join(log_dir, "reward.json"), "w", encoding="utf-8") as f:
                     json.dump(reward_infos, f, ensure_ascii=False, indent=2)
-
-            del videos, gt_videos
+                
+                # 清理日志记录用的视频
+                del last_batch_videos_for_log, last_batch_gt_videos_for_log, last_batch_prompts_for_log
 
             # 旧策略留档
             samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
             # 把 [batch] 形状的平均奖励扩展出时间维，复制成 [batch, num_train_timesteps]，方便未来在每个时间步叠加不同的修正项（ KL 奖励）
             samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(1).repeat(1, num_train_timesteps)
+            
+            # 关键修复：在gather之前确保所有进程都完成了samples的整理
+            accelerator.wait_for_everyone()
+            
             # gather rewards across processes
             gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
-            # CRITICAL: Ensure float32 dtype to avoid DT_DOUBLE on NPU
-            # tensor.cpu().numpy() preserves dtype, but explicitly convert to float32 for safety
-            gathered_rewards = {key: value.cpu().numpy().astype(np.float32) for key, value in gathered_rewards.items()}
+            gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
             # log rewards and images
             if accelerator.is_main_process:
                 wandb.log(
@@ -1362,8 +1511,8 @@ def main(_):
                 prompts = [""] * len(gathered_rewards['avg'])
                 advantages = stat_tracker.update(prompts, gathered_rewards['avg'])
                 if accelerator.is_local_main_process:
-                    print("len(prompts)", len(prompts))
-                    print("len unique prompts", len(set(prompts)))
+                    logger.info("len(prompts)", len(prompts))
+                    logger.info("len unique prompts", len(set(prompts)))
 
                 group_size, trained_prompt_num = stat_tracker.get_stats()
 
@@ -1378,24 +1527,19 @@ def main(_):
                     },step=global_step)
                 stat_tracker.clear()
             else:
-                # CRITICAL: Ensure float32 dtype to avoid DT_DOUBLE on NPU
                 advantages = (gathered_rewards['avg'] - gathered_rewards['avg'].mean()) / (gathered_rewards['avg'].std() + 1e-4)
-                advantages = advantages.astype(np.float32)  # Explicitly convert to float32
 
             # 把 NumPy 的 advantage 转回张量，并依据进程索引切出本地样本，再放回当前设备0
             # 这步操作确保只有当前进程能看到自己的样本对应的本地优势值。
-            # CRITICAL: Explicitly specify dtype=torch.float32 to avoid DT_DOUBLE on NPU
-            # torch.as_tensor() preserves numpy dtype (float64), so we must explicitly convert
             advantages = torch.as_tensor(advantages, dtype=torch.float32)
             samples["advantages"] = (
                 advantages.reshape(accelerator.num_processes, -1, advantages.shape[-1])[accelerator.process_index]
                 .to(accelerator.device)
             )
-            # if accelerator.is_local_main_process:
-            #     print("advantages: ", samples["advantages"].abs().mean())
+            if accelerator.is_local_main_process:
+                logger.info("advantages: ", samples["advantages"].abs().mean())
 
-            # 奖励已经转成 advantages，用不到的直接删，释放显存
-            print("release rewards")
+            # 奖励已经转成 advantages，用不到的直接删，释放显存。
             del samples["rewards"]
 
             # 把 NumPy 的 advantage 转回张量，并依据进程索引切出本地样本，再放回当前设备。
@@ -1431,14 +1575,15 @@ def main(_):
             assert num_timesteps == config.sample.num_steps
 
 
+        
         # Offload collated and filtered samples to CPU and save to disk; later training will load from disk on-demand
         if not loaded_samples_cache:
-            print("offload samples to cpu and save to disk")
+            logger.info("offload samples to cpu and save to disk")
             process_index = accelerator.process_index
             cache_dir = config.save_dir if hasattr(config, "save_dir") else "./latents_cache"
             os.makedirs(cache_dir, exist_ok=True)
             samples_file = os.path.join(cache_dir, f"samples_rank{process_index}_epoch{epoch}.pth")
-            print("samples_file", samples_file)
+            logger.info("samples_file", samples_file)
             # Move all tensors to CPU before saving to minimize device memory footprint
             def _to_cpu_tree(obj):
                 if torch.is_tensor(obj):
@@ -1454,8 +1599,71 @@ def main(_):
 
             torch.npu.empty_cache()
             # _print_npu_mem("after offload+empty_cache")
+            
+            # ========== 显存清理：完全释放SAMPLING阶段使用的模型和变量 ==========
+            logger.info(f"[Rank {accelerator.process_index}] Starting memory cleanup after SAMPLING phase...")
+            
+            # 1. 显式卸载VAE到CPU（训练阶段不需要VAE）
+            if hasattr(pipe, 'vae') and pipe.vae is not None:
+                logger.info("Moving VAE to CPU...")
+                pipe.vae.to("cpu")
+                # 如果VAE使用了vram_management，也需要清理
+                if hasattr(pipe.vae, 'vram_management_enabled') and pipe.vae.vram_management_enabled:
+                    for module in pipe.vae.modules():
+                        if hasattr(module, 'offload'):
+                            module.offload()
+            
+            # 2. 显式卸载Text Encoder到CPU（训练阶段不需要，prompt已经编码）
+            if hasattr(pipe, 'text_encoder') and pipe.text_encoder is not None:
+                logger.info("Moving Text Encoder to CPU...")
+                pipe.text_encoder.to("cpu")
+                if hasattr(pipe.text_encoder, 'vram_management_enabled') and pipe.text_encoder.vram_management_enabled:
+                    for module in pipe.text_encoder.modules():
+                        if hasattr(module, 'offload'):
+                            module.offload()
+            
+            # 3. 清理奖励函数使用的模型（multi_score在初始化时就创建了scorer，它们可能仍在GPU上）
+            # 注意：multi_score返回的函数是闭包，scorer在score_functions中被创建
+            # 由于scorer是通过闭包捕获的，我们无法直接访问它们
+            # 但是可以通过强制垃圾回收来清理（如果它们没有被其他引用持有）
+            logger.info("Cleaning up reward function models...")
+            # 注意：由于multi_score的设计，scorer在每次调用时可能被重新创建（如在clip_score中使用try-finally）
+            # 但如果scorer被缓存在某个地方，可能需要手动清理
+            # 这里我们主要依赖垃圾回收，但也可以尝试清理已知的全局scorer
+            try:
+                # 如果reward_fn有清理方法，调用它
+                if hasattr(reward_fn, 'cleanup') or hasattr(reward_fn, 'clear_cache'):
+                    if hasattr(reward_fn, 'cleanup'):
+                        reward_fn.cleanup()
+                    if hasattr(reward_fn, 'clear_cache'):
+                        reward_fn.clear_cache()
+            except Exception as e:
+                logger.warning(f"Failed to cleanup reward function: {e}")
+            
+            # 4. 清理pipeline的缓存状态
+            if hasattr(pipe, 'load_models_to_device'):
+                # 确保所有模型都被卸载（即使cpu_offload未启用，也手动卸载VAE和text_encoder）
+                pipe.load_models_to_device([])
+            
+            # 5. 清理所有可能的中间变量引用
+            # 删除samples字典中所有已移到CPU但仍可能持有GPU引用的变量
+            # （这些已经在保存时移到CPU了，但为了保险再次确认）
+            
+            # 6. 强制垃圾回收以释放所有不再使用的对象
+            import gc
+            gc.collect()
+            
+            # 7. 清空设备缓存（支持NPU和CUDA）
+            if hasattr(torch, 'npu') and torch.npu.is_available():
+                torch.npu.empty_cache()
+                torch.npu.synchronize()  # 确保所有操作完成
+            elif torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()  # 确保所有操作完成
+            
+            logger.info(f"[Rank {accelerator.process_index}] Memory cleanup completed. Ready for TRAINING phase.")
+            # ========== 显存清理结束 ==========
 
-                
 
         #################### TRAINING ####################
         # Reload samples from disk (kept on CPU); training loop will move needed pieces to device
@@ -1468,7 +1676,6 @@ def main(_):
         # num_inner_epochs 控制对同一批采样数据重复训练多少次，以充分利用数据
         for inner_epoch in range(config.train.num_inner_epochs):
             # shuffle samples along batch dimension
-            # Keep permutation on CPU since samples are on CPU
             perm = torch.randperm(total_batch_size)
             samples = {k: v[perm] for k, v in samples.items()}
 
@@ -1482,15 +1689,15 @@ def main(_):
 
             # Print memory usage of sample tensors before training (only first inner epoch)
             if inner_epoch == 0 and accelerator.is_local_main_process:
-                print("\n=== Sample tensors memory usage (CPU, full batch) ===")
+                logger.info("\n=== Sample tensors memory usage (CPU, full batch) ===")
                 for k, v in samples.items():
                     if torch.is_tensor(v):
                         numel = v.numel()
                         dtype_bytes = v.element_size()
                         total_bytes = numel * dtype_bytes
                         total_gb = total_bytes / (1024**3)
-                        print(f"  samples['{k}']: shape={v.shape}, dtype={v.dtype}, size={total_gb:.3f} GB")
-                print("=" * 60 + "\n")
+                        logger.info(f"  samples['{k}']: shape={v.shape}, dtype={v.dtype}, size={total_gb:.3f} GB")
+                logger.info("=" * 60 + "\n")
 
             # dict of lists -> list of dicts for easier iteration
             samples_batched = [
@@ -1500,15 +1707,16 @@ def main(_):
             # Print memory usage of a single minibatch (only first inner epoch, first minibatch)
             if inner_epoch == 0 and len(samples_batched) > 0 and accelerator.is_local_main_process:
                 sample_minibatch = samples_batched[0]
-                print("\n=== Single minibatch tensors memory usage (CPU) ===")
+                logger.info("\n=== Single minibatch tensors memory usage (CPU) ===")
                 for k, v in sample_minibatch.items():
                     if torch.is_tensor(v):
                         numel = v.numel()
                         dtype_bytes = v.element_size()
                         total_bytes = numel * dtype_bytes
                         total_gb = total_bytes / (1024**3)
-                        print(f"  minibatch['{k}']: shape={v.shape}, dtype={v.dtype}, size={total_gb:.3f} GB")
-                print("=" * 60 + "\n")
+                        logger.info(f"  minibatch['{k}']: shape={v.shape}, dtype={v.dtype}, size={total_gb:.3f} GB")
+                logger.info("=" * 60 + "\n")
+
 
             # train
             pipe.dit.train()
@@ -1523,24 +1731,25 @@ def main(_):
                 for key, value in list(sample.items()):
                     if torch.is_tensor(value):
                         sample[key] = value.to(device=accelerator.device, non_blocking=True)
-                # _print_npu_mem(f"after moving minibatch {i} to device")
 
                 train_timesteps = [step_index  for step_index in range(num_train_timesteps)]
                 
                 # Prepare source latents for ReCamMaster (already preprocessed)
                 source_latents = sample["source_latents"]  # (batch_size, C, T, H, W) - condition latents
                 target_cameras = sample["target_cameras"]  # (batch_size, 21, 12)
+
                 
                 # Source latents are already encoded, just ensure correct dtype and device
                 source_latents = source_latents.to(device=accelerator.device, dtype=pipe.torch_dtype)
-                # Ensure other tensors which will be used on device are also on device
                 sample["prompt_embeds"] = sample["prompt_embeds"].to(device=accelerator.device)
                 sample["timesteps"] = sample["timesteps"].to(device=accelerator.device)
                 sample["latents"] = sample["latents"].to(device=accelerator.device)
                 sample["next_latents"] = sample["next_latents"].to(device=accelerator.device)
-                sample["log_probs"] = sample["log_probs"].to(device=accelerator.device, dtype=torch.float32)
-                sample["advantages"] = sample["advantages"].to(device=accelerator.device, dtype=torch.float32)
-                # _print_npu_mem(f"before timestep loop minibatch {i}")
+                sample["log_probs"] = sample["log_probs"].to(device=accelerator.device)
+                sample["advantages"] = sample["advantages"].to(device=accelerator.device)
+                
+                # Source latents are already encoded, just ensure correct dtype and device
+                source_latents = source_latents.to(dtype=pipe.torch_dtype, device=accelerator.device)
                 
                 for j in tqdm(
                     train_timesteps,
@@ -1549,9 +1758,6 @@ def main(_):
                     leave=False,
                     disable=not accelerator.is_local_main_process,
                 ):
-                    # if j == train_timesteps[0]:  # Only print for first timestep to avoid spam
-                    #     _print_npu_mem(f"before timestep {j} loop (minibatch {i})")
-                    
                     with accelerator.accumulate(transformer):
                         with autocast():
                             prev_sample, log_prob, prev_sample_mean, std_dev_t = compute_log_prob_recam(
@@ -1563,10 +1769,8 @@ def main(_):
                                 target_cameras,
                                 source_latents,
                                 config,
-                                negative_prompt_embeds=train_neg_prompt_embeds[: len(sample["prompt_embeds"])],
-                                _print_npu_mem=_print_npu_mem if j == train_timesteps[0] else None  # Only print for first timestep
+                                negative_prompt_embeds=train_neg_prompt_embeds[: len(sample["prompt_embeds"])]
                             )
-                            
                             if config.train.beta > 0:
                                 with torch.no_grad():
                                     with transformer.module.disable_adapter():
@@ -1579,11 +1783,22 @@ def main(_):
                                             target_cameras,
                                             source_latents,
                                             config,
-                                            negative_prompt_embeds=train_neg_prompt_embeds[: len(sample["prompt_embeds"])],
-                                            _print_npu_mem=_print_npu_mem if j == train_timesteps[0] else None
+                                            negative_prompt_embeds=train_neg_prompt_embeds[: len(sample["prompt_embeds"])]
                                         )
-                                # if j == train_timesteps[0]:
-                                #     _print_npu_mem(f"after compute_log_prob_recam (ref, timestep {j})")
+
+                        # # 用于调试报错
+                        # # RuntimeError: Expected to have finished reduction in the prior iteration before starting a new one. This error indicates that your module has parameters that were not used in producing loss. You can enable unused parameter detection by passing the keyword argument `find_unused_parameters=True` to `torch.nn.parallel.DistributedDataParallel`, and by 
+                        # # making sure all `forward` function outputs participate in calculating loss. 
+                        # # If you already have done the above, then the distributed data parallel module wasn't able to locate the output tensors in the return value of your module's `forward` function. Please include the loss function and the structure of the return value of `forward` of your module when reporting this issue (e.g. list, dict, iterable).
+                        # # Parameter indices which did not receive grad for rank 0: 8 9 18 19 28 29 38 39 48 49 58 59 68 69 78 79 88 89 98 99 108 109 118 119 128 129 138 139 148 149 158 159 168 169 178 179 188 189 198 199 208 209 218 219 228 229 238 239 248 249 258 259 268 269 278 279 288 289 298 299
+                        # # In addition, you can set the environment variable TORCH_DISTRIBUTED_DEBUG to either INFO or DETAIL to print out information about which particular parameters did not receive gradient on this rank as part of this error
+                        # for name, param in transformer.named_parameters():
+                        #     if param.grad is None:
+                        #         print(f"No gradient for Parameter {name}")
+                        #     else:
+                        #         grad_status = param.requires_grad
+                        #         has_grad = param.grad is not None
+                        #         print(f"Parameter {name}: requires_grad={grad_status}, has_grad={has_grad}")
 
                         # grpo logic
                         advantages = torch.clamp(
@@ -1599,68 +1814,61 @@ def main(_):
                             1.0 + config.train.clip_range,
                         )
                         policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+
                         if config.train.beta > 0:
-                            # print(f"[DEBUG] Before KL loss computation:")
-                            # print(f"  prev_sample_mean: dtype={prev_sample_mean.dtype}, requires_grad={prev_sample_mean.requires_grad}")
-                            # print(f"  prev_sample_mean_ref: dtype={prev_sample_mean_ref.dtype}, requires_grad={prev_sample_mean_ref.requires_grad}")
-                            # print(f"  std_dev_t: dtype={std_dev_t.dtype}, requires_grad={std_dev_t.requires_grad}")
-                            
-                            two = torch.tensor(2.0, dtype=torch.float32, device=prev_sample_mean.device)
-                            kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=(1,2,3), keepdim=True) / (two * std_dev_t ** 2)
+                            kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=(1,2,3), keepdim=True) / (2 * std_dev_t ** 2)
                             kl_loss = torch.mean(kl_loss)
                             loss = policy_loss + config.train.beta * kl_loss
                         else:
                             loss = policy_loss
-                        
-                        
-                        info["approx_kl"].append(
-                            0.5 * torch.mean((log_prob - sample["log_probs"][:, j]) ** 2)
-                        )
-                        info["clipfrac"].append(
-                            torch.mean((torch.abs(ratio - 1.0) > config.train.clip_range).float())
-                        )
-                        info["clipfrac_gt_one"].append(
-                            torch.mean((ratio - 1.0 > config.train.clip_range).float())
-                        )
-                        info["clipfrac_lt_one"].append(
-                            torch.mean((1.0 - ratio > config.train.clip_range).float())
-                        )
+
+                        info["approx_kl"].append(0.5 * torch.mean((log_prob - sample["log_probs"][:, j]) ** 2))
+                        info["clipfrac"].append(torch.mean((torch.abs(ratio - 1.0) > config.train.clip_range).float()))
+
                         info["policy_loss"].append(policy_loss)
                         if config.train.beta > 0:
                             info["kl_loss"].append(kl_loss)
 
+                        
+                        # print("="*100)
+                        # print("loss.dtype", loss.dtype)
+                        # print("policy_loss.dtype", policy_loss.dtype)
+                        # print("kl_loss.dtype", kl_loss.dtype)
+                        # print("advantages.dtype", advantages.dtype)
+                        # print("log_prob.dtype", log_prob.dtype)
+                        # print("sample['log_probs'].dtype", sample["log_probs"].dtype)
+                        # print("sample['advantages'].dtype", sample["advantages"].dtype)
+                        # print("sample['latents'].dtype", sample["latents"].dtype)
+                        # print("="*100)
+
+                        # # ---- begin diagnostic (temporary) ----
+                        # try:
+                        #     print("DEBUG: loss.dtype =", getattr(loss, "dtype", None))
+                        # except Exception:
+                        #     pass
+
+                        # # 打印几个 LoRA 相关参数的 dtype（只打印首个匹配，避免刷屏）
+                        # cnt = 0
+                        # for n, p in transformer.named_parameters():
+                        #     if ("lora" in n or "projector" in n or "cam_encoder" in n) and cnt < 8:
+                        #         print(f"DEBUG PARAM: {n} dtype={p.dtype} device={p.device} requires_grad={p.requires_grad}")
+                        #         cnt += 1
+                        #     if cnt >= 8:
+                        #         break
+                        # # ---- end diagnostic ----
+
+
+                        loss = loss.to(dtype=torch.bfloat16)
                         info["loss"].append(loss)
 
+                        # backward pass
                         accelerator.backward(loss)
-                        
-                        # CRITICAL: Clear references after backward to help free memory
-                        # Note: We cannot detach() as that would break gradient accumulation,
-                        # but we can delete references to help garbage collection
-                        # The computation graph will be kept until gradient_accumulation_steps is reached
-                        del loss, policy_loss, unclipped_loss, clipped_loss, ratio
-                        if config.train.beta > 0:
-                            del kl_loss
-                        
                         if accelerator.sync_gradients:
                             accelerator.clip_grad_norm_(
                                 transformer.parameters(), config.train.max_grad_norm
                             )
                         optimizer.step()
                         optimizer.zero_grad()
-                        # if j == train_timesteps[0]:
-                        #     _print_npu_mem(f"after optimizer step (timestep {j}, minibatch {i})")
-                        
-                        # CRITICAL: After optimizer.step(), the computation graph from this timestep is no longer needed
-                        # Detach intermediate outputs to release computation graph memory
-                        # This prevents accumulation of activations across timesteps
-                        if 'prev_sample' in locals():
-                            del prev_sample, log_prob, prev_sample_mean, std_dev_t
-                        if config.train.beta > 0 and 'prev_sample_mean_ref' in locals():
-                            del prev_sample_mean_ref
-                        
-                        # Force garbage collection to free memory
-                        torch.npu.empty_cache()
-
 
                     # Checks if the accelerator has performed an optimization step behind the scenes
                     if accelerator.sync_gradients:
