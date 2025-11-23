@@ -429,10 +429,10 @@ def my_recam_8npu():
     config.num_frames = 81
     config.reward_fn = {
         # "my_reward": 0.3,
-        "clip_score": 0.3,
-        "pick_score": 0.1,
-        "optical_reward": 0.2,
-        "gt_reward": 0.4,
+        "clip_score": 0.2,
+        "pick_score": 0.2,
+        "optical_reward": 0.3,
+        "gt_reward": 0.3,
     }
     config.dataset = "/home/ma-user/modelarts/user-job-dir/wlh/Data/MultiCamVideo-Dataset"
     
@@ -447,8 +447,8 @@ def my_recam_8npu():
 
     # A large num_epochs is intentionally set here. Training will be manually stopped once sufficient
     config.num_epochs = 100000
-    config.save_freq = 60 # epoch
-    config.eval_freq = 30
+    config.save_freq = 10 # epoch
+    config.eval_freq = 10
 
 
     config.train.batch_size = config.sample.train_batch_size

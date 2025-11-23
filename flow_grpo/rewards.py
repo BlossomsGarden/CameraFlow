@@ -236,22 +236,59 @@ Dynamic Control————
     Endpoint Error：target <-> GT，EPE，接近0好
 """
 def optical_reward(device):
-    from flow_grpo.rewards_patch.searaft.optical_reward import optical_eval
+    from flow_grpo.rewards_patch.searaft.optical_reward import optical_eval, SPRING_ARGS, CameraControlRewardSystem
     from flow_grpo.rewards_patch.searaft.optical_reward import load_video_frames
+    import sys
+    import torch
+    
+    # 添加必要的import路径
+    sys.path.append('/home/ma-user/modelarts/user-job-dir/wlh/Code/FlowGRPO/flow_grpo/rewards_patch/searaft/core')
+    from raft import RAFT
+    from utils.utils import load_ckpt
 
     def _fn(output_video, gt_video, prompts):
         # VGG backbone expects float32 tensors; convert from bf16 if needed
         output_video = output_video.float()
         gt_video = gt_video.float()
 
-        batch_size = output_video.shape[0]
-        scores = []
-        for b in range(batch_size):
-            # input (C, T, H, W)
-            score = optical_eval(output_video[b], gt_video[b], min_frames=81, device=device, video_layout="cthw")
-            scores.append(float(score))
+        # 在_fn内部初始化模型，避免重复创建导致NPU设备同步冲突
+        args = SPRING_ARGS
+        model = RAFT(args)
+        load_ckpt(model, '/home/ma-user/modelarts/user-job-dir/wlh/Model/SeaRaft/Tartan-C-T-TSKH-spring540x960-M.pth')
         
-        return scores
+        # 同步设备操作，避免NPU设备冲突
+        device_obj = torch.device(device)
+        if hasattr(torch, 'npu') and torch.npu.is_available():
+            torch.npu.synchronize()
+        model = model.to(device_obj)
+        if hasattr(torch, 'npu') and torch.npu.is_available():
+            torch.npu.synchronize()
+        model.eval()
+        
+        # 创建reward系统
+        reward_system = CameraControlRewardSystem(args, model, device_obj, video_layout="cthw")
+
+        try:
+            batch_size = output_video.shape[0]
+            scores = []
+            for b in range(batch_size):
+                # input (C, T, H, W)
+                # 复用已创建的模型和reward系统
+                score = optical_eval(
+                    output_video[b], 
+                    gt_video[b], 
+                    min_frames=81, 
+                    device=device, 
+                    video_layout="cthw",
+                    model=model,
+                    reward_system=reward_system
+                )
+                scores.append(float(score))
+            
+            return scores
+        finally:
+            # 释放资源，将模型移回CPU并清理缓存
+            _release_modules(model, reward_system)
 
     return _fn
 
@@ -322,13 +359,46 @@ def gt_reward(device):
         lpips_values = []
         for b in range(B):
             for t in range(T):
-                lpips = vggp(output_video[b, :, t], gt_video[b, :, t])
-                lpips_values.append(lpips.item())
+                # 确保输入格式正确：[C, H, W] -> [1, C, H, W] (添加batch维度)
+                # 并确保在正确的设备上
+                frame_output = output_video[b, :, t].unsqueeze(0)  # [1, C, H, W]
+                frame_gt = gt_video[b, :, t].unsqueeze(0)  # [1, C, H, W]
+                
+                # 确保在正确的设备上
+                if frame_output.device != device:
+                    frame_output = frame_output.to(device)
+                if frame_gt.device != device:
+                    frame_gt = frame_gt.to(device)
+                
+                # 同步NPU操作，避免异步问题
+                if hasattr(torch, 'npu') and torch.npu.is_available():
+                    torch.npu.synchronize()
+                
+                try:
+                    lpips = vggp(frame_output, frame_gt)
+                    # 确保结果在CPU上再取item，避免NPU内存错误
+                    if hasattr(torch, 'npu') and torch.npu.is_available():
+                        torch.npu.synchronize()
+                    lpips_value = lpips.cpu().item() if lpips.device.type != 'cpu' else lpips.item()
+                    lpips_values.append(lpips_value)
+                except Exception as e:
+                    # 如果发生错误，使用默认值
+                    print(f"Warning: LPIPS calculation failed for batch {b}, frame {t}: {e}")
+                    lpips_values.append(0.0)
+                finally:
+                    # 清理中间变量
+                    del frame_output, frame_gt
+                    if hasattr(torch, 'npu') and torch.npu.is_available():
+                        torch.npu.empty_cache()
 
         mean_lpips = float(np.mean(lpips_values))
         print("LPIPS end")
         
-        scores = [mean_ssim * 0.3 + mean_lpips * 0.7] * B
+        # 关键修复：SSIM越高越好，LPIPS越低越好
+        # 需要将LPIPS转换为"越高越好"的形式：使用 (1 - mean_lpips)
+        # 或者使用负号：mean_ssim * 0.5 - mean_lpips * 0.5
+        # 这里使用 (1 - mean_lpips) 保持两个指标都在[0,1]范围内，且都是越高越好
+        scores = [mean_ssim * 0.5 + (1.0 - mean_lpips) * 0.5] * B
 
         return scores
 
@@ -523,9 +593,6 @@ def multi_score(device, score_dict):
     def _fn(output_video, gt_video, prompts):
         total_scores = []
         score_details = {}
-        print("="*100)
-        print("device", device)
-        print("="*100)
         score_items = list(score_dict.items())
         for score_name, weight in tqdm(
             score_items,

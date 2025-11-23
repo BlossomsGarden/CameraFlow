@@ -170,8 +170,13 @@ class ReCamMasterDataset(Dataset):
                 # 7.1 Read camera extrinsics file
                 base_path = path_tgt.rsplit('/', 2)[0]  # Get scene directory
                 tgt_camera_path = os.path.join(base_path, "cameras", "camera_extrinsics.json")
-                with open(tgt_camera_path, 'r') as file:
-                    cam_data = json.load(file)
+                try:
+                    with open(tgt_camera_path, 'r') as file:
+                        cam_data = json.load(file)
+                except json.JSONDecodeError as e:
+                    print(f"JSON decode error in file: {tgt_camera_path}")
+                    print(f"Error details: {e}")
+                    raise
                 
                 # 7.2 Select frames (sample every 4 frames: 81 frames -> 21 frames)
                 # This aligns with VAE temporal downsampling
@@ -538,6 +543,12 @@ def recam_pipeline_with_logprob(
     source_latents = all_latents[:, :, 21:, ...]  # (batch_size, 16, 21, 60, 104)
     target_latents = all_latents[:, :, :21, ...]   # (batch_size, 16, 21, 60, 104)
     
+    # Ensure source_latents and target_latents are on the correct device
+    # This is important because in the second epoch, tensors might be on a different device
+    # due to previous model offloading operations
+    source_latents = source_latents.to(device=device)
+    target_latents = target_latents.to(device=device)
+    
     # Encode source video to latents
     tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
     
@@ -635,6 +646,9 @@ def recam_pipeline_with_logprob(
                 pipeline.scheduler.timesteps[i],
                 latents_input_target,
             )
+            # Ensure latents are on the correct device after scheduler.step()
+            # scheduler.step() may return tensors on a different device, especially after model offloading
+            latents = latents.to(device=device)
             
             # Step 5: Compute log probability for GRPO training
             # 步骤5：计算对数概率（用于 GRPO 强化学习训练）
@@ -671,10 +685,10 @@ def recam_pipeline_with_logprob(
                 "step": f"{i+1}/{len(timesteps)}"
             })
     
+
     # Decode video (both cached and newly generated paths reach here)
     pipeline.load_models_to_device(['vae'])
-    # frames = pipeline.vae.decode(latents.to(dtype=pipeline.torch_dtype), device=device, **tiler_kwargs)
-    # gt_frames = pipeline.vae.decode(target_latents.to(dtype=pipeline.torch_dtype), device=device, **tiler_kwargs)
+    pipeline.vae.to(device=device)
     videos = pipeline.vae.decode(latents.to(dtype=pipeline.torch_dtype), device=device, **tiler_kwargs)
     gt_videos = pipeline.vae.decode(target_latents.to(dtype=pipeline.torch_dtype), device=device, **tiler_kwargs)
     pipeline.load_models_to_device([])
@@ -689,13 +703,17 @@ def eval(pipeline, test_dataloader, test_neg_prompt_embed, config, accelerator, 
     if config.train.ema:
         ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
 
-    # test_dataloader = itertools.islice(test_dataloader, 2)
+    # 限制评估的样本数量以加快评估速度
+    max_eval_samples = getattr(config, 'max_eval_samples', 8)  # 默认评估8个样本
+    
     all_rewards = defaultdict(list)
     last_batch_videos = None
     last_batch_gt_videos = None     # <-- Keep gt_videos for saving
     last_batch_prompts = None
     last_batch_rewards = None
     # last_batch_source_videos = None  # <-- Remove source video variable
+    
+    total_evaluated_samples = 0  # 累计已评估的样本数量
 
     for test_batch in tqdm(
         test_dataloader,
@@ -703,6 +721,9 @@ def eval(pipeline, test_dataloader, test_neg_prompt_embed, config, accelerator, 
         disable=not accelerator.is_local_main_process,
         position=0,
     ):
+        # 如果已经评估了足够的样本，提前退出
+        if total_evaluated_samples >= max_eval_samples:
+            break
         # Note: the following print statements referenced all_latents before definition, move them later if needed
 
         prompts, batch_data = test_batch
@@ -722,8 +743,23 @@ def eval(pipeline, test_dataloader, test_neg_prompt_embed, config, accelerator, 
 
         # The last batch may not be full batch_size
         batch_size = all_latents.shape[0]
-        if batch_size < test_neg_prompt_embed.shape[0]:
-            current_neg_prompt_embeds = test_neg_prompt_embed[:batch_size]
+        
+        # 限制当前batch处理的样本数量，确保不超过max_eval_samples
+        remaining_samples = max_eval_samples - total_evaluated_samples
+        if remaining_samples <= 0:
+            break
+        
+        # 如果当前batch的样本数超过剩余需要的样本数，只处理需要的部分
+        actual_batch_size = min(batch_size, remaining_samples)
+        if actual_batch_size < batch_size:
+            # 只处理前actual_batch_size个样本
+            all_latents = all_latents[:actual_batch_size]
+            target_cameras = target_cameras[:actual_batch_size]
+            prompt_embeds = prompt_embeds[:actual_batch_size]
+            prompts = prompts[:actual_batch_size] if isinstance(prompts, list) else prompts
+        
+        if actual_batch_size < test_neg_prompt_embed.shape[0]:
+            current_neg_prompt_embeds = test_neg_prompt_embed[:actual_batch_size]
         else:
             current_neg_prompt_embeds = test_neg_prompt_embed
 
@@ -757,6 +793,9 @@ def eval(pipeline, test_dataloader, test_neg_prompt_embed, config, accelerator, 
         for key, value in rewards.items():
             rewards_gather = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
             all_rewards[key].append(rewards_gather)
+
+        # 更新累计评估的样本数量
+        total_evaluated_samples += actual_batch_size
 
         # Save last batch for video saving
         last_batch_videos = videos
@@ -819,7 +858,8 @@ def eval(pipeline, test_dataloader, test_neg_prompt_embed, config, accelerator, 
         eval_dir = os.path.join(config.logdir if hasattr(config, 'logdir') else "./logs", config.run_name if hasattr(config, 'run_name') else "eval", f"epoch {epoch} eval")
         os.makedirs(eval_dir, exist_ok=True)
 
-        num_samples = min(15, len(last_batch_videos_gather))
+        # 限制保存的视频数量为max_eval_samples（默认7个）
+        num_samples = min(max_eval_samples, len(last_batch_videos_gather))
         sample_indices = range(num_samples)
 
         # Convert videos to numpy frames and save as video files
@@ -1018,7 +1058,11 @@ def main(_):
     # 3. Load ReCamMaster checkpoint
     # Load checkpoint to the correct device for each process
     # 为每个进程加载 checkpoint 到正确的设备
-    state_dict = torch.load(config.pretrained.recam_model, map_location=accelerator.device)
+    # 先加载到CPU，避免NPU设备同步冲突
+    state_dict = torch.load(config.pretrained.recam_model, map_location='cpu')
+    # 同步NPU操作
+    if hasattr(torch, 'npu') and torch.npu.is_available():
+        torch.npu.synchronize()
     missing, unexpected = pipe.dit.load_state_dict(state_dict, strict=False)
     if missing:
         print("load_state_dict missing keys:", missing)
@@ -1242,36 +1286,24 @@ def main(_):
     for epoch in range(first_epoch, config.num_epochs):
         ################### EVAL ####################
         pipe.dit.eval()
-        if epoch % config.eval_freq == 0:
+        if epoch % config.eval_freq == 0 and epoch > 0:
             eval(pipe, test_dataloader, test_neg_prompt_embed, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters, epoch)
         if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
             logger.info(f"Saving checkpoint at epoch {epoch}")
             save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
 
-        # Check if collated samples cache for this epoch already exists; if so, skip sampling
-        # Use global process index to avoid filename collisions across nodes
-        process_index = accelerator.process_index
-        cache_dir = config.save_dir if hasattr(config, "save_dir") else "./latents_cache"
-        os.makedirs(cache_dir, exist_ok=True)
-        samples_file = os.path.join(cache_dir, f"samples_rank{process_index}_epoch{epoch}.pth")
-        loaded_samples_cache = False
-        if os.path.exists(samples_file):
-            logger.info(f"Found existing samples cache at {samples_file}, skipping sampling and going to training.")
-            loaded_samples_cache = True
-
         #################### SAMPLING ####################
-        if not loaded_samples_cache:
-            pipe.dit.eval()
-            # Prepare scheduler
-            pipe.scheduler.set_timesteps(config.sample.num_steps, denoising_strength=1.0, shift=5.0)
+        pipe.dit.eval()
+        # Prepare scheduler
+        pipe.scheduler.set_timesteps(config.sample.num_steps, denoising_strength=1.0, shift=5.0)
 
-            samples = []
-            # 用于日志记录的videos和gt_videos（只在需要时保存最后一个batch）
-            last_batch_videos_for_log = None
-            last_batch_gt_videos_for_log = None
-            last_batch_prompts_for_log = None
-            
-            for i in tqdm(
+        samples = []
+        # 用于日志记录的videos和gt_videos（只在需要时保存最后一个batch）
+        last_batch_videos_for_log = None
+        last_batch_gt_videos_for_log = None
+        last_batch_prompts_for_log = None
+        
+        for i in tqdm(
                 range(config.sample.num_batches_per_epoch),
                 desc=f"Epoch {epoch}: sampling",
                 disable=not accelerator.is_local_main_process,
@@ -1302,9 +1334,17 @@ def main(_):
                 cache_loaded = False
                 if use_cache and os.path.exists(cache_file):
                     logger.info(f"[Rank {process_index}] Loading sample cache from {cache_file}")
-                    cache_data = torch.load(cache_file, map_location=accelerator.device)
+                    # 先加载到CPU，避免NPU设备同步冲突
+                    cache_data = torch.load(cache_file, map_location='cpu')
+                    # 同步NPU操作
+                    if hasattr(torch, 'npu') and torch.npu.is_available():
+                        torch.npu.synchronize()
+                    # 然后移动到目标设备
                     videos = cache_data["videos"].to(accelerator.device)
                     gt_videos = cache_data["gt_videos"].to(accelerator.device)
+                    # 同步NPU操作
+                    if hasattr(torch, 'npu') and torch.npu.is_available():
+                        torch.npu.synchronize()
                     latent_trajectory = cache_data["latent_trajectory"]
                     log_probs = cache_data["log_probs"]
                     cache_loaded = True
@@ -1337,16 +1377,16 @@ def main(_):
                                 num_frames=config.num_frames
                             )
                     
-                    # # 1. 保存 videos、latent_trajectory、log_probs 到缓存文件（每个进程/worker独立的文件名）
-                    # force_save = True
-                    # if force_save or (not os.path.exists(cache_file)):
-                    #     torch.save({
-                    #             "videos": videos,
-                    #             "gt_videos": gt_videos,
-                    #             "latent_trajectory": latent_trajectory,
-                    #             "log_probs": log_probs,
-                    #         }, cache_file)
-                    #     logger.info(f"[Rank {process_index}] Saved sample cache to {cache_file}")
+                    # 1. 保存 videos、latent_trajectory、log_probs 到缓存文件（每个进程/worker独立的文件名）
+                    force_save = True
+                    if force_save or (not os.path.exists(cache_file)):
+                        torch.save({
+                                "videos": videos,
+                                "gt_videos": gt_videos,
+                                "latent_trajectory": latent_trajectory,
+                                "log_probs": log_probs,
+                            }, cache_file)
+                        logger.info(f"[Rank {process_index}] Saved sample cache to {cache_file}")
 
                 # Stack latents/log_probs so downstream code can slice timestep by timestep
                 if isinstance(latent_trajectory, list):
@@ -1388,7 +1428,7 @@ def main(_):
                     "timesteps": timesteps,                                             # (sample_batch_size, num_steps)
                     "latents": latent_trajectory[:, :-1],                               # (batch_size, num_steps, C, T, H, W)
                     "next_latents": latent_trajectory[:, 1:],                           # 下一个状态序列：z_{T-1} 到 z_0
-                    "log_probs": log_probs,                                             # (batch_size, num_steps)
+                    "log_probs": log_probs,                                             # (batch_size, num_steps) - OLD策略的log_probs
                     "rewards": rewards,                                                 # 异步计算的奖励信号
                 })
                 
@@ -1411,265 +1451,228 @@ def main(_):
                 # 清理其他中间变量
                 del latent_trajectory, log_probs, timesteps, all_latents, target_camera, prompt_embeds
 
-            # wait for all rewards to be computed
-            # 阶段2：等待所有任务完成（阻塞等待）
-            # 如果等待每个奖励计算完成再生成下一批：
-            # 需要存储所有中间状态，内存占用会很高
-            # 异步模式：
-            # 生成完立即释放相关资源，只存储最终的奖励结果
-            for sample_idx, sample in enumerate(tqdm(
-                samples,
-                desc="Waiting for rewards",
-                disable=not accelerator.is_local_main_process,
-                position=0,
-            )):
-                rewards = sample["rewards"].result()
-                sample["rewards"] = {
-                    key: torch.as_tensor(value, device=accelerator.device).float()
-                    for key, value in rewards.items()
-                }
-                logger.info("sample['rewards']", sample["rewards"])
-
-            # 关键修复：确保所有进程都完成了奖励计算，再执行后续操作
-            accelerator.wait_for_everyone()
-
-            # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
-            samples = {
-                k: torch.cat([s[k] for s in samples], dim=0)
-                if not isinstance(samples[0][k], dict)
-                else {
-                    sub_key: torch.cat([s[k][sub_key] for s in samples], dim=0)
-                    for sub_key in samples[0][k]
-                }
-                for k in samples[0].keys()
+        # wait for all rewards to be computed
+        # 阶段2：等待所有任务完成（阻塞等待）
+        # 如果等待每个奖励计算完成再生成下一批：
+        # 需要存储所有中间状态，内存占用会很高
+        # 异步模式：
+        # 生成完立即释放相关资源，只存储最终的奖励结果
+        for sample_idx, sample in enumerate(tqdm(
+            samples,
+            desc="Waiting for rewards",
+            disable=not accelerator.is_local_main_process,
+            position=0,
+        )):
+            rewards = sample["rewards"].result()
+            sample["rewards"] = {
+                key: torch.as_tensor(value, device=accelerator.device).float()
+                for key, value in rewards.items()
             }
+            logger.info("sample['rewards']", sample["rewards"])
 
-            # 日志记录（使用保存的最后一个batch的视频）
-            if epoch % 10 == 0 and accelerator.is_main_process and last_batch_videos_for_log is not None:
-                # Log sample videos
-                log_dir = f"./logs/{epoch}/"
-                os.makedirs(log_dir, exist_ok=True)
-                
-                frames = pipe.tensor2video(last_batch_videos_for_log)
-                gt_frames = pipe.tensor2video(last_batch_gt_videos_for_log)
+        # 关键修复：确保所有进程都完成了奖励计算，再执行后续操作
+        accelerator.wait_for_everyone()
 
-                num_samples = min(15, len(last_batch_videos_for_log))
-                sample_indices = random.sample(range(len(last_batch_videos_for_log)), num_samples)
-                reward_infos = []
+        # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
+        samples = {
+            k: torch.cat([s[k] for s in samples], dim=0)
+            if not isinstance(samples[0][k], dict)
+            else {
+                sub_key: torch.cat([s[k][sub_key] for s in samples], dim=0)
+                for sub_key in samples[0][k]
+            }
+            for k in samples[0].keys()
+        }
 
-                for idx, i in enumerate(sample_indices):
-                    # Save video with process-specific filename to avoid overwriting
-                    save_video(frames[i], os.path.join(log_dir, f"{idx}.mp4"), fps=20, quality=5)
-                    save_video(gt_frames[i], os.path.join(log_dir, f"{idx}_gt.mp4"), fps=20, quality=5)
-
-                    prompt_str = last_batch_prompts_for_log[i] if last_batch_prompts_for_log and i < len(last_batch_prompts_for_log) else ""
-                    # 注意：这里使用的reward索引可能与videos索引不对应（因为videos是最后一个batch的）
-                    # 为了正确获取reward，我们需要知道最后一个batch在samples中的起始索引
-                    avg_reward = 0.0  # 无法准确获取对应的reward，设为0
-                    if "rewards" in samples and len(samples["rewards"]["avg"]) > 0:
-                        # 假设最后一个batch在samples的最后
-                        last_batch_start_idx = len(samples["rewards"]["avg"]) - len(last_batch_videos_for_log)
-                        if 0 <= last_batch_start_idx + i < len(samples["rewards"]["avg"]):
-                            avg_reward = samples["rewards"]["avg"][last_batch_start_idx + i].item()
-                    reward_infos.append({
-                        "filename": os.path.join(log_dir, f"{idx}.mp4"),
-                        "prompt": prompt_str,
-                        "avg_reward": avg_reward
-                    })
-
-                # Save reward info as JSON
-                with open(os.path.join(log_dir, "reward.json"), "w", encoding="utf-8") as f:
-                    json.dump(reward_infos, f, ensure_ascii=False, indent=2)
-                
-                # 清理日志记录用的视频
-                del last_batch_videos_for_log, last_batch_gt_videos_for_log, last_batch_prompts_for_log
-
-            # 旧策略留档
-            samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
-            # 把 [batch] 形状的平均奖励扩展出时间维，复制成 [batch, num_train_timesteps]，方便未来在每个时间步叠加不同的修正项（ KL 奖励）
-            samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(1).repeat(1, num_train_timesteps)
+        # 日志记录（使用保存的最后一个batch的视频）
+        if epoch % 10 == 0 and accelerator.is_main_process and last_batch_videos_for_log is not None:
+            # Log sample videos
+            log_dir = f"./logs/{epoch}/"
+            os.makedirs(log_dir, exist_ok=True)
             
-            # 关键修复：在gather之前确保所有进程都完成了samples的整理
-            accelerator.wait_for_everyone()
+            frames = pipe.tensor2video(last_batch_videos_for_log)
+            gt_frames = pipe.tensor2video(last_batch_gt_videos_for_log)
+
+            num_samples = min(15, len(last_batch_videos_for_log))
+            sample_indices = random.sample(range(len(last_batch_videos_for_log)), num_samples)
+            reward_infos = []
+
+            for idx, i in enumerate(sample_indices):
+                # Save video with process-specific filename to avoid overwriting
+                save_video(frames[i], os.path.join(log_dir, f"{idx}.mp4"), fps=20, quality=5)
+                save_video(gt_frames[i], os.path.join(log_dir, f"{idx}_gt.mp4"), fps=20, quality=5)
+
+                prompt_str = last_batch_prompts_for_log[i] if last_batch_prompts_for_log and i < len(last_batch_prompts_for_log) else ""
+                # 注意：这里使用的reward索引可能与videos索引不对应（因为videos是最后一个batch的）
+                # 为了正确获取reward，我们需要知道最后一个batch在samples中的起始索引
+                avg_reward = 0.0  # 无法准确获取对应的reward，设为0
+                if "rewards" in samples and len(samples["rewards"]["avg"]) > 0:
+                    # 假设最后一个batch在samples的最后
+                    last_batch_start_idx = len(samples["rewards"]["avg"]) - len(last_batch_videos_for_log)
+                    if 0 <= last_batch_start_idx + i < len(samples["rewards"]["avg"]):
+                        avg_reward = samples["rewards"]["avg"][last_batch_start_idx + i].item()
+                reward_infos.append({
+                    "filename": os.path.join(log_dir, f"{idx}.mp4"),
+                    "prompt": prompt_str,
+                    "avg_reward": avg_reward
+                })
+
+            # Save reward info as JSON
+            with open(os.path.join(log_dir, "reward.json"), "w", encoding="utf-8") as f:
+                json.dump(reward_infos, f, ensure_ascii=False, indent=2)
             
-            # gather rewards across processes
-            gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
-            gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
-            # log rewards and images
-            if accelerator.is_main_process:
-                wandb.log(
-                    {
-                        "epoch": epoch,
-                        **{f"reward_{key}": value.mean() for key, value in gathered_rewards.items() if '_strict_accuracy' not in key and '_accuracy' not in key},
-                    },
-                    step=global_step,
-                )
+            # 清理日志记录用的视频
+            del last_batch_videos_for_log, last_batch_gt_videos_for_log, last_batch_prompts_for_log
 
-            # per-prompt mean/std tracking
-            if config.per_prompt_stat_tracking:
-                # gather the prompts across processes
-                prompts = [""] * len(gathered_rewards['avg'])
-                advantages = stat_tracker.update(prompts, gathered_rewards['avg'])
-                if accelerator.is_local_main_process:
-                    logger.info("len(prompts)", len(prompts))
-                    logger.info("len unique prompts", len(set(prompts)))
-
-                group_size, trained_prompt_num = stat_tracker.get_stats()
-
-                zero_std_ratio, reward_std_mean = calculate_zero_std_ratio(prompts, gathered_rewards)
-
-                if accelerator.is_main_process:
-                    wandb.log({
-                        "group_size": group_size,
-                        "trained_prompt_num": trained_prompt_num,
-                        "zero_std_ratio": zero_std_ratio,
-                        "reward_std_mean": reward_std_mean,
-                    },step=global_step)
-                stat_tracker.clear()
-            else:
-                advantages = (gathered_rewards['avg'] - gathered_rewards['avg'].mean()) / (gathered_rewards['avg'].std() + 1e-4)
-
-            # 把 NumPy 的 advantage 转回张量，并依据进程索引切出本地样本，再放回当前设备0
-            # 这步操作确保只有当前进程能看到自己的样本对应的本地优势值。
-            advantages = torch.as_tensor(advantages, dtype=torch.float32)
-            samples["advantages"] = (
-                advantages.reshape(accelerator.num_processes, -1, advantages.shape[-1])[accelerator.process_index]
-                .to(accelerator.device)
+        # 旧策略留档
+        samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
+        # 把 [batch] 形状的平均奖励扩展出时间维，复制成 [batch, num_train_timesteps]，方便未来在每个时间步叠加不同的修正项（ KL 奖励）
+        samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(1).repeat(1, num_train_timesteps)
+        
+        # 关键修复：在gather之前确保所有进程都完成了samples的整理
+        accelerator.wait_for_everyone()
+        
+        # gather rewards across processes
+        gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
+        gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
+        # log rewards and images
+        if accelerator.is_main_process:
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    **{f"reward_{key}": value.mean() for key, value in gathered_rewards.items() if '_strict_accuracy' not in key and '_accuracy' not in key},
+                },
+                step=global_step,
             )
+
+        # per-prompt mean/std tracking
+        if config.per_prompt_stat_tracking:
+            # gather the prompts across processes
+            prompts = [""] * len(gathered_rewards['avg'])
+            advantages = stat_tracker.update(prompts, gathered_rewards['avg'])
             if accelerator.is_local_main_process:
-                logger.info("advantages: ", samples["advantages"].abs().mean())
+                print("len(prompts)", len(prompts))
+                print("len unique prompts", len(set(prompts)))
 
-            # 奖励已经转成 advantages，用不到的直接删，释放显存。
-            del samples["rewards"]
+            group_size, trained_prompt_num = stat_tracker.get_stats()
 
-            # 把 NumPy 的 advantage 转回张量，并依据进程索引切出本地样本，再放回当前设备。
-            mask = (samples["advantages"].abs().sum(dim=1) != 0)
-            
-            # If the number of True values in mask is not divisible by config.sample.num_batches_per_epoch,
-            # randomly change some False values to True to make it divisible
-            num_batches = config.sample.num_batches_per_epoch
-            true_count = mask.sum()
-            if true_count % num_batches != 0:
-                false_indices = torch.where(~mask)[0]
-                num_to_change = num_batches - (true_count % num_batches)
-                if len(false_indices) >= num_to_change:
-                    random_indices = torch.randperm(len(false_indices))[:num_to_change]
-                    mask[false_indices[random_indices]] = True
+            zero_std_ratio, reward_std_mean = calculate_zero_std_ratio(prompts, gathered_rewards)
+
             if accelerator.is_main_process:
                 wandb.log({
-                    "actual_batch_size": mask.sum().item()//config.sample.num_batches_per_epoch,
-                }, step=global_step)
-            # Filter out samples where the entire time dimension of advantages is zero
-            samples = {k: v[mask] for k, v in samples.items()}
+                    "group_size": group_size,
+                    "trained_prompt_num": trained_prompt_num,
+                    "zero_std_ratio": zero_std_ratio,
+                    "reward_std_mean": reward_std_mean,
+                },step=global_step)
+            stat_tracker.clear()
+        else:
+            advantages = (gathered_rewards['avg'] - gathered_rewards['avg'].mean()) / (gathered_rewards['avg'].std() + 1e-4)
 
-            # samples["timesteps"]
-            # 采样阶段（调用流水线生成轨迹）时，为每个样本保存的一维时间步序列，形状是 (batch, num_steps)
-            # 因此该张量的第 0 维是样本数，第 1 维是单条轨迹包含的扩散/积分时间步数。
-            #
-            # total_batch_size
-            # 过滤后的样本数量（也就是 samples["timesteps"] 的 batch 维度）。在后续会用它来打乱、重新分批这些样本参与训练。
-            #
-            # num_timesteps
-            # 等于 samples["timesteps"] 的第二维，表示每条轨迹包含的时间步个数
-            total_batch_size, num_timesteps = samples["timesteps"].shape
-            assert num_timesteps == config.sample.num_steps
+        # 把 NumPy 的 advantage 转回张量，并依据进程索引切出本地样本，再放回当前设备0
+        # 这步操作确保只有当前进程能看到自己的样本对应的本地优势值。
+        advantages = torch.as_tensor(advantages, dtype=torch.float32)
+        samples["advantages"] = (
+            advantages.reshape(accelerator.num_processes, -1, advantages.shape[-1])[accelerator.process_index]
+            .to(accelerator.device)
+        )
+        if accelerator.is_local_main_process:
+            print("advantages: ", samples["advantages"].abs().mean())
+
+        # 奖励已经转成 advantages，用不到的直接删，释放显存。
+        del samples["rewards"]
+
+        # 把 NumPy 的 advantage 转回张量，并依据进程索引切出本地样本，再放回当前设备。
+        mask = (samples["advantages"].abs().sum(dim=1) != 0)
+        
+        # If the number of True values in mask is not divisible by config.sample.num_batches_per_epoch,
+        # randomly change some False values to True to make it divisible
+        num_batches = config.sample.num_batches_per_epoch
+        true_count = mask.sum()
+        if true_count % num_batches != 0:
+            false_indices = torch.where(~mask)[0]
+            num_to_change = num_batches - (true_count % num_batches)
+            if len(false_indices) >= num_to_change:
+                random_indices = torch.randperm(len(false_indices))[:num_to_change]
+                mask[false_indices[random_indices]] = True
+        if accelerator.is_main_process:
+            wandb.log({
+                "actual_batch_size": mask.sum().item()//config.sample.num_batches_per_epoch,
+            }, step=global_step)
+        # Filter out samples where the entire time dimension of advantages is zero
+        samples = {k: v[mask] for k, v in samples.items()}
+
+        # samples["timesteps"]
+        # 采样阶段（调用流水线生成轨迹）时，为每个样本保存的一维时间步序列，形状是 (batch, num_steps)
+        # 因此该张量的第 0 维是样本数，第 1 维是单条轨迹包含的扩散/积分时间步数。
+        #
+        # total_batch_size
+        # 过滤后的样本数量（也就是 samples["timesteps"] 的 batch 维度）。在后续会用它来打乱、重新分批这些样本参与训练。
+        #
+        # num_timesteps
+        # 等于 samples["timesteps"] 的第二维，表示每条轨迹包含的时间步个数
+        total_batch_size, num_timesteps = samples["timesteps"].shape
+        assert num_timesteps == config.sample.num_steps
 
 
         
-        # Offload collated and filtered samples to CPU and save to disk; later training will load from disk on-demand
-        if not loaded_samples_cache:
-            logger.info("offload samples to cpu and save to disk")
-            process_index = accelerator.process_index
-            cache_dir = config.save_dir if hasattr(config, "save_dir") else "./latents_cache"
-            os.makedirs(cache_dir, exist_ok=True)
-            samples_file = os.path.join(cache_dir, f"samples_rank{process_index}_epoch{epoch}.pth")
-            logger.info("samples_file", samples_file)
-            # Move all tensors to CPU before saving to minimize device memory footprint
-            def _to_cpu_tree(obj):
-                if torch.is_tensor(obj):
-                    return obj.detach().to("cpu")
-                if isinstance(obj, dict):
-                    return {k: _to_cpu_tree(v) for k, v in obj.items()}
-                return obj
-            samples_cpu = {k: _to_cpu_tree(v) for k, v in samples.items()}
-            torch.save(samples_cpu, samples_file)
-            # Release references and empty device cache (NPU if available)
-            del samples_cpu
-            del samples
-
-            torch.npu.empty_cache()
-            # _print_npu_mem("after offload+empty_cache")
-            
-            # ========== 显存清理：完全释放SAMPLING阶段使用的模型和变量 ==========
-            logger.info(f"[Rank {accelerator.process_index}] Starting memory cleanup after SAMPLING phase...")
-            
-            # 1. 显式卸载VAE到CPU（训练阶段不需要VAE）
-            if hasattr(pipe, 'vae') and pipe.vae is not None:
-                logger.info("Moving VAE to CPU...")
-                pipe.vae.to("cpu")
-                # 如果VAE使用了vram_management，也需要清理
-                if hasattr(pipe.vae, 'vram_management_enabled') and pipe.vae.vram_management_enabled:
-                    for module in pipe.vae.modules():
-                        if hasattr(module, 'offload'):
-                            module.offload()
-            
-            # 2. 显式卸载Text Encoder到CPU（训练阶段不需要，prompt已经编码）
-            if hasattr(pipe, 'text_encoder') and pipe.text_encoder is not None:
-                logger.info("Moving Text Encoder to CPU...")
-                pipe.text_encoder.to("cpu")
-                if hasattr(pipe.text_encoder, 'vram_management_enabled') and pipe.text_encoder.vram_management_enabled:
-                    for module in pipe.text_encoder.modules():
-                        if hasattr(module, 'offload'):
-                            module.offload()
-            
-            # 3. 清理奖励函数使用的模型（multi_score在初始化时就创建了scorer，它们可能仍在GPU上）
-            # 注意：multi_score返回的函数是闭包，scorer在score_functions中被创建
-            # 由于scorer是通过闭包捕获的，我们无法直接访问它们
-            # 但是可以通过强制垃圾回收来清理（如果它们没有被其他引用持有）
-            logger.info("Cleaning up reward function models...")
-            # 注意：由于multi_score的设计，scorer在每次调用时可能被重新创建（如在clip_score中使用try-finally）
-            # 但如果scorer被缓存在某个地方，可能需要手动清理
-            # 这里我们主要依赖垃圾回收，但也可以尝试清理已知的全局scorer
-            try:
-                # 如果reward_fn有清理方法，调用它
-                if hasattr(reward_fn, 'cleanup') or hasattr(reward_fn, 'clear_cache'):
-                    if hasattr(reward_fn, 'cleanup'):
-                        reward_fn.cleanup()
-                    if hasattr(reward_fn, 'clear_cache'):
-                        reward_fn.clear_cache()
-            except Exception as e:
-                logger.warning(f"Failed to cleanup reward function: {e}")
-            
-            # 4. 清理pipeline的缓存状态
-            if hasattr(pipe, 'load_models_to_device'):
-                # 确保所有模型都被卸载（即使cpu_offload未启用，也手动卸载VAE和text_encoder）
-                pipe.load_models_to_device([])
-            
-            # 5. 清理所有可能的中间变量引用
-            # 删除samples字典中所有已移到CPU但仍可能持有GPU引用的变量
-            # （这些已经在保存时移到CPU了，但为了保险再次确认）
-            
-            # 6. 强制垃圾回收以释放所有不再使用的对象
-            import gc
-            gc.collect()
-            
-            # 7. 清空设备缓存（支持NPU和CUDA）
-            if hasattr(torch, 'npu') and torch.npu.is_available():
-                torch.npu.empty_cache()
-                torch.npu.synchronize()  # 确保所有操作完成
-            elif torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()  # 确保所有操作完成
-            
-            logger.info(f"[Rank {accelerator.process_index}] Memory cleanup completed. Ready for TRAINING phase.")
-            # ========== 显存清理结束 ==========
+        # ========== 显存清理：完全释放SAMPLING阶段使用的模型和变量 ==========
+        logger.info(f"[Rank {accelerator.process_index}] Starting memory cleanup after SAMPLING phase...")
+        
+        # 1. 显式卸载VAE到CPU（训练阶段不需要VAE）
+        logger.info("Moving VAE to CPU...")
+        pipe.vae.to("cpu")
+        
+        # 2. 显式卸载Text Encoder到CPU（训练阶段不需要，prompt已经编码）
+        logger.info("Moving Text Encoder to CPU...")
+        pipe.text_encoder.to("cpu")
+        
+        # 3. 清理奖励函数使用的模型（multi_score在初始化时就创建了scorer，它们可能仍在GPU上）
+        # 注意：multi_score返回的函数是闭包，scorer在score_functions中被创建
+        # 由于scorer是通过闭包捕获的，我们无法直接访问它们
+        # 但是可以通过强制垃圾回收来清理（如果它们没有被其他引用持有）
+        logger.info("Cleaning up reward function models...")
+        # 注意：由于multi_score的设计，scorer在每次调用时可能被重新创建（如在clip_score中使用try-finally）
+        # 但如果scorer被缓存在某个地方，可能需要手动清理
+        # 这里我们主要依赖垃圾回收，但也可以尝试清理已知的全局scorer
+        try:
+            # 如果reward_fn有清理方法，调用它
+            if hasattr(reward_fn, 'cleanup') or hasattr(reward_fn, 'clear_cache'):
+                if hasattr(reward_fn, 'cleanup'):
+                    reward_fn.cleanup()
+                if hasattr(reward_fn, 'clear_cache'):
+                    reward_fn.clear_cache()
+        except Exception as e:
+            logger.warning(f"Failed to cleanup reward function: {e}")
+        
+        # 4. 清理pipeline的缓存状态
+        pipe.load_models_to_device([])
+        
+        # 5. 将samples中的tensors移到CPU以释放GPU显存
+        # 注意：samples字典现在保持在内存中，不保存到文件
+        def _to_cpu_tree(obj):
+            if torch.is_tensor(obj):
+                return obj.detach().to("cpu")
+            if isinstance(obj, dict):
+                return {k: _to_cpu_tree(v) for k, v in obj.items()}
+            return obj
+        samples = {k: _to_cpu_tree(v) for k, v in samples.items()}
+        
+        # 6. 强制垃圾回收以释放所有不再使用的对象
+        import gc
+        gc.collect()
+        
+        # 7. 清空设备缓存（支持NPU和CUDA）
+        torch.npu.empty_cache()
+        torch.npu.synchronize()  # 确保所有操作完成
+        
+        logger.info(f"[Rank {accelerator.process_index}] Memory cleanup completed. Ready for TRAINING phase.")
+        # ========== 显存清理结束 ==========
 
 
         #################### TRAINING ####################
-        # Reload samples from disk (kept on CPU); training loop will move needed pieces to device
-        samples = torch.load(samples_file, map_location="cpu")
-        # _print_npu_mem("after loading samples (CPU)")
-        # Ensure shapes are available regardless of sampling path (still on CPU)
+        # Use samples directly from memory (already moved to CPU during cleanup)
+        # Ensure shapes are available
         total_batch_size, num_timesteps = samples["timesteps"].shape
 
 
@@ -1772,6 +1775,9 @@ def main(_):
                                 negative_prompt_embeds=train_neg_prompt_embeds[: len(sample["prompt_embeds"])]
                             )
                             if config.train.beta > 0:
+                                # KL散度正则化：使用reference模型（基础pretrained模型，通过disable_adapter得到）
+                                # 注意：这不是OLD策略，而是用于防止策略偏离基础模型太远的正则化项
+                                # OLD策略的log_probs已经在sampling阶段记录在sample["log_probs"]中
                                 with torch.no_grad():
                                     with transformer.module.disable_adapter():
                                         _, _, prev_sample_mean_ref, _ = compute_log_prob_recam(
@@ -1806,7 +1812,7 @@ def main(_):
                             -config.train.adv_clip_max,
                             config.train.adv_clip_max,
                         )
-                        ratio = torch.exp(log_prob - sample["log_probs"][:, j])
+                        ratio = torch.exp(log_prob - sample["log_probs"][:, j])  # new_log_prob - old_log_prob
                         unclipped_loss = -advantages * ratio
                         clipped_loss = -advantages * torch.clamp(
                             ratio,

@@ -327,7 +327,7 @@ class CameraControlRewardSystem:
         """
         
         if weights is None:
-            weights = {'temporal': 0.35, 'quality': 0.35, 'epe': 0.15, 'flow_ssim': 0.15}
+            weights = {'temporal': 0.15, 'quality': 0.35, 'epe': 0.35, 'flow_ssim': 0.15}
         
         # 计算各分量reward
         temporal_reward = self.compute_temporal_consistency(output_target_video)
@@ -424,18 +424,27 @@ def load_camera_extrinsics(json_path, num_frames=None, camera_id="cam01"):
     return torch.stack(extrinsics_list)
 
 
-def optical_eval(output_target_video, gt_target_video, min_frames=81, device='npu', video_layout = "cthw"):
+def optical_eval(output_target_video, gt_target_video, min_frames=81, device='npu', video_layout = "cthw", model=None, reward_system=None):
     # 初始化参数和模型
     args = SPRING_ARGS
-    # 加载光流模型
-    model = RAFT(args)
-    load_ckpt(model, '/home/ma-user/modelarts/user-job-dir/wlh/Model/SeaRaft/Tartan-C-T-TSKH-spring540x960-M.pth')
     device = torch.device(device)
-    model = model.to(device)
-    model.eval()
     
-    # 初始化reward系统
-    reward_system = CameraControlRewardSystem(args, model, device, video_layout=video_layout)
+    # 如果模型未提供，则创建新模型（用于向后兼容）
+    if model is None:
+        # 加载光流模型
+        model = RAFT(args)
+        load_ckpt(model, '/home/ma-user/modelarts/user-job-dir/wlh/Model/SeaRaft/Tartan-C-T-TSKH-spring540x960-M.pth')
+        # 同步设备操作，避免NPU设备冲突
+        if hasattr(torch, 'npu') and torch.npu.is_available():
+            torch.npu.synchronize()
+        model = model.to(device)
+        if hasattr(torch, 'npu') and torch.npu.is_available():
+            torch.npu.synchronize()
+        model.eval()
+    
+    # 如果reward系统未提供，则创建新的（用于向后兼容）
+    if reward_system is None:
+        reward_system = CameraControlRewardSystem(args, model, device, video_layout=video_layout)
     
     # 加载源视频
     source_video = None     # 暂时不用原视频
