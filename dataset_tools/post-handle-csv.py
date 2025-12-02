@@ -125,7 +125,7 @@ def validate_csv_format(csv_path):
 
 
 def main():
-    output_csv_path = "/data/wlh/ReCamMaster/MultiCamVideo-Dataset/MultiCamVideo-Dataset/metadata-f35-f24.csv"
+    output_csv_path = "metadata-f24-train.csv"
     
     
     print("Cleaning CSV file encoding...")
