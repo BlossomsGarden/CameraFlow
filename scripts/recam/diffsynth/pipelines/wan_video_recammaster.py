@@ -404,6 +404,8 @@ def model_fn_wan_video(
     #     dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
     #     dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     # ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+    
+    torch.npu.synchronize()
     # 小张量拷贝
     f0 = dit.freqs[0][:f].to(x.device) 
     h0 = dit.freqs[1][:h].to(x.device)
@@ -412,6 +414,7 @@ def model_fn_wan_video(
     # print("f0.shape", f0.shape)
     # print("h0.shape", h0.shape)
     # print("w0.shape", w0.shape)
+    torch.npu.synchronize()
     freqs = torch.cat([
         f0.view(f, 1, 1, -1).expand(f, h, w, -1),
         h0.view(1, h, 1, -1).expand(f, h, w, -1),

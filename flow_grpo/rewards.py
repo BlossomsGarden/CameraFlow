@@ -1,5 +1,6 @@
 from PIL import Image
 import io
+import math
 import numpy as np
 import torch
 import torch_npu
@@ -33,7 +34,9 @@ def _release_modules(*modules):
 def imagereward_score(device):
     from flow_grpo.imagereward_scorer import ImageRewardScorer
 
-    def _fn(images, prompts):
+    def _fn(images, prompts, gt_video=None, cam_extrinsics=None):
+        # 打印确认传入的参数格式
+        print(f"[imagereward_score] images 类型: {type(images)}, gt_video: {gt_video}, cam_extrinsics 类型: {type(cam_extrinsics)}")
         scorer = ImageRewardScorer(dtype=torch.float32, device=device)
         try:
             if isinstance(images, torch.Tensor):
@@ -48,79 +51,18 @@ def imagereward_score(device):
 
     return _fn
 
-def qwenvl_score(device):
-    from flow_grpo.qwenvl import QwenVLScorer
 
-    def _fn(images, prompts):
-        scorer = QwenVLScorer(dtype=torch.bfloat16, device=device)
-        try:
-            if isinstance(images, torch.Tensor):
-                images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
-                images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
-                images = [Image.fromarray(image) for image in images]
-            prompts = [prompt for prompt in prompts]
-            scores = scorer(prompts, images)
-            return scores, {}
-        finally:
-            _release_modules(scorer)
-
-    return _fn
-
-
-def unifiedreward_score_remote(device):
-    """Submits images to UnifiedReward and computes a reward.
+def unifiedreward_score_sglang(device, max_concurrent_requests=2):
     """
-    import requests
-    from requests.adapters import HTTPAdapter, Retry
-    from io import BytesIO
-    import pickle
-
-    batch_size = 64
-    url = "http://10.82.120.15:18085"
-    sess = requests.Session()
-    retries = Retry(
-        total=1000, backoff_factor=1, status_forcelist=[500], allowed_methods=False
-    )
-    sess.mount("http://", HTTPAdapter(max_retries=retries))
-
-    def _fn(images, prompts):
-        if isinstance(images, torch.Tensor):
-            images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
-            images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
-        images_batched = np.array_split(images, np.ceil(len(images) / batch_size))
-        prompts_batched = np.array_split(prompts, np.ceil(len(prompts) / batch_size))
-
-        all_scores = []
-        for image_batch, prompt_batch in zip(images_batched, prompts_batched):
-            jpeg_images = []
-
-            # Compress the images using JPEG
-            for image in image_batch:
-                img = Image.fromarray(image)
-                buffer = BytesIO()
-                img.save(buffer, format="JPEG")
-                jpeg_images.append(buffer.getvalue())
-
-            # format for LLaVA server
-            data = {
-                "images": jpeg_images,
-                "prompts": prompt_batch
-            }
-            data_bytes = pickle.dumps(data)
-
-            # send a request to the llava server
-            response = sess.post(url, data=data_bytes, timeout=120)
-            print("response: ", response)
-            print("response: ", response.content)
-            response_data = pickle.loads(response.content)
-
-            all_scores += response_data["outputs"]
-
-        return all_scores, {}
-
-    return _fn
-
-def unifiedreward_score_sglang(device):
+    使用 SGLang 服务器进行 UnifiedReward 评分
+    
+    Args:
+        device: 设备（此函数中未直接使用，但保持接口一致性）
+        max_concurrent_requests: 最大并发请求数，防止服务器端显存爆炸
+                                建议值：根据服务器GPU显存大小调整
+                                - 24GB显存: 2-4
+                                - 48GB显存: 4-8
+    """
     import asyncio
     from openai import AsyncOpenAI
     import base64
@@ -149,37 +91,45 @@ def unifiedreward_score_sglang(device):
         return scores
 
     client = AsyncOpenAI(base_url="http://127.0.0.1:17140/v1", api_key="flowgrpo")
-        
+    
+    # 创建信号量来限制并发请求数
+    semaphore = asyncio.Semaphore(max_concurrent_requests)
+    
     async def evaluate_image(prompt, image):
-        question = f"<image>\nYou are given a text caption and a generated image based on that caption. Your task is to evaluate this image based on two key criteria:\n1. Alignment with the Caption: Assess how well this image aligns with the provided caption. Consider the accuracy of depicted objects, their relationships, and attributes as described in the caption.\n2. Overall Image Quality: Examine the visual quality of this image, including clarity, detail preservation, color accuracy, and overall aesthetic appeal.\nBased on the above criteria, assign a score from 1 to 5 after \'Final Score:\'.\nYour task is provided as follows:\nText Caption: [{prompt}]"
-        images_base64 = pil_image_to_base64(image)
-        response = await client.chat.completions.create(
-            model="UnifiedReward-7b-v1.5",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": images_base64},
-                        },
-                        {
-                            "type": "text",
-                            "text": question,
-                        },
-                    ],
-                },
-            ],
-            temperature=0,
-        )
-        return response.choices[0].message.content
+        # 使用信号量控制并发数
+        async with semaphore:
+            question = f"<image>\nYou are given a text caption and a generated image based on that caption. Your task is to evaluate this image based on two key criteria:\n1. Alignment with the Caption: Assess how well this image aligns with the provided caption. Consider the accuracy of depicted objects, their relationships, and attributes as described in the caption.\n2. Overall Image Quality: Examine the visual quality of this image, including clarity, detail preservation, color accuracy, and overall aesthetic appeal.\nBased on the above criteria, assign a score from 1 to 5 after \'Final Score:\'.\nYour task is provided as follows:\nText Caption: [{prompt}]"
+            images_base64 = pil_image_to_base64(image)
+            response = await client.chat.completions.create(
+                model="UnifiedReward-7b-v1.5",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": images_base64},
+                            },
+                            {
+                                "type": "text",
+                                "text": question,
+                            },
+                        ],
+                    },
+                ],
+                temperature=0,
+            )
+            return response.choices[0].message.content
 
     async def evaluate_batch_image(images, prompts):
         tasks = [evaluate_image(prompt, img) for prompt, img in zip(prompts, images)]
+        # 使用 asyncio.gather 并发执行，但受 semaphore 控制实际并发数
         results = await asyncio.gather(*tasks)
         return results
 
-    def _fn(images, prompts):
+    def _fn(images, prompts, gt_video=None, cam_extrinsics=None):
+        # 打印确认传入的参数格式
+        print(f"[unifiedreward_score_sglang] images 类型: {type(images)}, gt_video: {gt_video}, cam_extrinsics 类型: {type(cam_extrinsics)}")
         # 处理Tensor类型转换
         if isinstance(images, torch.Tensor):
             images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
@@ -188,7 +138,7 @@ def unifiedreward_score_sglang(device):
         # 转换为PIL Image并调整尺寸
         images = [Image.fromarray(image).resize((512, 512)) for image in images]
 
-        # 执行异步批量评估
+        # 执行异步批量评估（受 max_concurrent_requests 限制）
         text_outputs = asyncio.run(evaluate_batch_image(images, prompts))
         score = _extract_scores(text_outputs)
         score = [sc/5.0 for sc in score]
@@ -201,7 +151,9 @@ def unifiedreward_score_sglang(device):
 def video_ocr_score(device):
     from flow_grpo.ocr import OcrScorer_video_or_image
 
-    def _fn(images, prompts):
+    def _fn(images, prompts, gt_video=None, cam_extrinsics=None):
+        # 打印确认传入的参数格式
+        print(f"[video_ocr_score] images 类型: {type(images)}, gt_video: {gt_video}, cam_extrinsics 类型: {type(cam_extrinsics)}")
         scorer = OcrScorer_video_or_image()
         try:
             if isinstance(images, torch.Tensor):
@@ -222,10 +174,16 @@ def video_ocr_score(device):
 
 def my_reward():
     """Custom reward function for ReCamMaster training"""
-    def _fn(output_video, gt_video, prompts):
+    def _fn(output_video, gt_video, prompts, cam_extrinsics=None):
+        # 打印确认传入的参数格式
+        print(f"[my_reward] output_video 类型: {type(output_video)}, gt_video: {gt_video}, cam_extrinsics 类型: {type(cam_extrinsics)}")
         # Return placeholder scores (list of zeros with length = batch_size)
-        scores = [0.0] * output_video.shape[0]
-        return scores
+        batch_size = output_video.shape[0]
+        scores = [0.0] * batch_size
+        return {
+            'scores': scores,
+            'details': {}
+        }
 
     return _fn
 
@@ -246,7 +204,12 @@ def optical_reward(device):
     from raft import RAFT
     from utils.utils import load_ckpt
 
-    def _fn(output_video, gt_video, prompts):
+    def _fn(output_video, gt_video, prompts, cam_extrinsics=None):
+        # 打印确认传入的参数格式
+        print(f"[optical_reward] output_video 类型: {type(output_video)}, gt_video: {gt_video}, cam_extrinsics 类型: {type(cam_extrinsics)}")
+        if cam_extrinsics is not None:
+            if isinstance(cam_extrinsics, torch.Tensor):
+                print(f"[optical_reward] cam_extrinsics.shape: {cam_extrinsics.shape}")
         # VGG backbone expects float32 tensors; convert from bf16 if needed
         output_video = output_video.float()
         gt_video = gt_video.float()
@@ -271,10 +234,12 @@ def optical_reward(device):
         try:
             batch_size = output_video.shape[0]
             scores = []
+            details_list = []
+            from flow_grpo.rewards_patch.searaft.optical_reward import optical_eval_with_details
             for b in range(batch_size):
                 # input (C, T, H, W)
                 # 复用已创建的模型和reward系统
-                score = optical_eval(
+                score, reward_components = optical_eval_with_details(
                     output_video[b], 
                     gt_video[b], 
                     min_frames=81, 
@@ -284,8 +249,22 @@ def optical_reward(device):
                     reward_system=reward_system
                 )
                 scores.append(float(score))
+                details_list.append(reward_components)
             
-            return scores
+            # 聚合详细指标（每个batch一个值）
+            aggregated_details = {}
+            if details_list:
+                for key in details_list[0].keys():
+                    if key != 'total_reward':  # 跳过total_reward，因为已经有scores了
+                        values = [d.get(key, 0.0) for d in details_list if isinstance(d.get(key), (int, float))]
+                        if values:
+                            # 为每个batch样本分配相同的聚合值
+                            aggregated_details[key] = values if len(values) == batch_size else [np.mean(values)] * batch_size
+            
+            return {
+                'scores': scores,
+                'details': aggregated_details
+            }
         finally:
             # 释放资源，将模型移回CPU并清理缓存
             _release_modules(model, reward_system)
@@ -301,7 +280,12 @@ def gt_reward(device):
     import torch.nn.functional as F
     from flow_grpo.lpips_score import VGGPerceptual
 
-    def _fn(output_video, gt_video, prompts):
+    def _fn(output_video, gt_video, prompts, cam_extrinsics=None):
+        # 打印确认传入的参数格式
+        print(f"[gt_reward] output_video 类型: {type(output_video)}, gt_video: {gt_video}, cam_extrinsics 类型: {type(cam_extrinsics)}")
+        if cam_extrinsics is not None:
+            if isinstance(cam_extrinsics, torch.Tensor):
+                print(f"[gt_reward] cam_extrinsics.shape: {cam_extrinsics.shape}")
         # VGG backbone expects float32 tensors and tensors on the same device as the model
         output_video = output_video.float()
         gt_video = gt_video.float()
@@ -359,48 +343,34 @@ def gt_reward(device):
         lpips_values = []
         for b in range(B):
             for t in range(T):
-                # 确保输入格式正确：[C, H, W] -> [1, C, H, W] (添加batch维度)
-                # 并确保在正确的设备上
-                frame_output = output_video[b, :, t].unsqueeze(0)  # [1, C, H, W]
-                frame_gt = gt_video[b, :, t].unsqueeze(0)  # [1, C, H, W]
-                
-                # 确保在正确的设备上
-                if frame_output.device != device:
-                    frame_output = frame_output.to(device)
-                if frame_gt.device != device:
-                    frame_gt = frame_gt.to(device)
-                
-                # 同步NPU操作，避免异步问题
-                if hasattr(torch, 'npu') and torch.npu.is_available():
-                    torch.npu.synchronize()
-                
-                try:
-                    lpips = vggp(frame_output, frame_gt)
-                    # 确保结果在CPU上再取item，避免NPU内存错误
-                    if hasattr(torch, 'npu') and torch.npu.is_available():
-                        torch.npu.synchronize()
-                    lpips_value = lpips.cpu().item() if lpips.device.type != 'cpu' else lpips.item()
-                    lpips_values.append(lpips_value)
-                except Exception as e:
-                    # 如果发生错误，使用默认值
-                    print(f"Warning: LPIPS calculation failed for batch {b}, frame {t}: {e}")
-                    lpips_values.append(0.0)
-                finally:
-                    # 清理中间变量
-                    del frame_output, frame_gt
-                    if hasattr(torch, 'npu') and torch.npu.is_available():
-                        torch.npu.empty_cache()
+                lpips = vggp(output_video[b, :, t], gt_video[b, :, t])
+                lpips_values.append(lpips.item())
 
         mean_lpips = float(np.mean(lpips_values))
-        print("LPIPS end")
         
         # 关键修复：SSIM越高越好，LPIPS越低越好
-        # 需要将LPIPS转换为"越高越好"的形式：使用 (1 - mean_lpips)
-        # 或者使用负号：mean_ssim * 0.5 - mean_lpips * 0.5
-        # 这里使用 (1 - mean_lpips) 保持两个指标都在[0,1]范围内，且都是越高越好
-        scores = [mean_ssim * 0.5 + (1.0 - mean_lpips) * 0.5] * B
+        # LPIPS值范围是[0, ∞)，需要归一化到[0,1]范围
+        # 使用双曲函数归一化：1 / (1 + lpips / scale)
+        # 当lpips=0（完美匹配）时，归一化值=1（最高奖励）
+        # 当lpips增大时，归一化值平滑衰减，始终在[0,1]范围内，不会出现负值
+        # scale控制衰减速度，scale越大衰减越慢
+        # 对于LPIPS，通常值在0~2之间，scale=1.0比较合适
+        # 如果LPIPS值普遍较大（>2），可以增大scale（如2.0或3.0）
+        lpips_scale = 1.0  # 可以根据实际LPIPS值分布调整
+        normalized_lpips = 1.0 / (1.0 + mean_lpips / lpips_scale)
+        
+        # 现在两个指标都是越大越好，且都在[0,1]范围内
+        scores = [mean_ssim * 0.7 + normalized_lpips * 0.3] * B
 
-        return scores
+        # 返回详细指标，用于wandb记录
+        return {
+            'scores': scores,
+            'details': {
+                'ssim': [mean_ssim] * B,
+                'lpips': [mean_lpips] * B,  # 原始LPIPS值
+                'normalized_lpips': [normalized_lpips] * B,  # 归一化后的LPIPS值
+            }
+        }
 
     return _fn
 
@@ -408,37 +378,24 @@ def gt_reward(device):
 """
 Video Quality————
     UnifiedReward (TODO)
-    PickScore
-    CLIP-T
-    CLIP-F
     CLIP-V
 """
-def clip_score(device):
+def clip_v_score(device):
     """
-    Returns a unified CLIP-based reward for video generation, integrating CLIP-T (text-image), 
-    CLIP-F (intra-video frame), and CLIP-V (source-target aligned frame) criteria into 
-    a numerically bounded, differentiable, and theoretically justified reward for RL.
+    Returns CLIP-V score: Cosine similarity between ground truth and generated corresponding frames.
+    All components are normalized to produce a reward in [0, 1].
 
-    The unified CLIP reward is a weighted sum of:
-        - clip_t: CLIP text-image similarity (mean over frames/batch)
-        - clip_f: Average cosine similarity between consecutive frame embeddings
-        - clip_v: Cosine similarity between ground truth and generated corresponding frames
-
-    All components are normalized and combined to produce a reward in [0, 1], 
-    facilitating effective and stable RL training.
-
-    Usage: score = clip_score(device)(output_video, gt_video, prompts)
-    Returns: scalar reward (float), with a dictionary of individual sub-scores.
+    Usage: score = clip_v_score(device)(output_video, gt_video, prompts, cam_extrinsics)
+    Returns: reward tensor of shape [B, 1]
     """
     import torch
     import torch.nn.functional as F
     import numpy as np
     from flow_grpo.clip_scorer import ClipScorer
 
-    # Weighting: these should be validated for task/research, here uniform; adjust as needed.
-    W_T, W_F, W_V = 0.4, 0.2, 0.4
-
-    def _fn(output_video, gt_video, prompts):
+    def _fn(output_video, gt_video, prompts, cam_extrinsics=None):
+        # 打印确认传入的参数格式
+        print(f"[clip_v_score] output_video 类型: {type(output_video)}, gt_video: {gt_video}, cam_extrinsics 类型: {type(cam_extrinsics)}")
         scorer = ClipScorer(device=device)
         try:
             # output_video, gt_video: [B, C, T, H, W], float32, [0,1] or [0,255]
@@ -446,32 +403,9 @@ def clip_score(device):
             gt_video = gt_video.to(device)
             B, C, T, H, W = output_video.shape
 
-            clip_t_list = []
-            clip_f_list = []
             clip_v_list = []
 
             for b in range(B):
-                # ------ CLIP-T ------
-                frames = output_video[b]  # [C, T, H, W]
-                prompt = prompts[b] if isinstance(prompts, (list, tuple)) else prompts
-                frames_t_first = frames.permute(1, 0, 2, 3)  # [T, C, H, W]
-                frame_scores = scorer(pixels=frames_t_first, prompts=prompt)  # [T]
-                if isinstance(frame_scores, torch.Tensor):
-                    clip_t_list.append(torch.mean(frame_scores).item())
-                else:
-                    clip_t_list.append(float(np.mean(frame_scores)))
-
-                # ------ CLIP-F ------
-                if T < 2:
-                    clip_f_list.append(0.0)
-                else:
-                    with torch.no_grad():
-                        processed_frames = scorer._process(frames_t_first).to(device)  # [T, C, H, W]
-                        features = scorer.model.get_image_features(pixel_values=processed_frames)  # [T, D]
-                        features = F.normalize(features, p=2, dim=1)
-                        similarities = F.cosine_similarity(features[:-1], features[1:], dim=1)  # [T-1]
-                        clip_f_list.append(similarities.mean().item())
-
                 # ------ CLIP-V ------
                 src_frames = gt_video[b]
                 tgt_frames = output_video[b]
@@ -493,35 +427,13 @@ def clip_score(device):
                         similarities = F.cosine_similarity(src_feat, tgt_feat, dim=1)  # [min_frames]
                         clip_v_list.append(similarities.mean().item())
 
-            # Normalization
-            # [B] array
-            clip_t_arr = torch.tensor(clip_t_list, dtype=torch.float32)
-            clip_f_arr = torch.tensor(clip_f_list, dtype=torch.float32)
+            # Normalization: CLIP-V cosine similarity is in [-1, 1], map to [0, 1]
             clip_v_arr = torch.tensor(clip_v_list, dtype=torch.float32)
-
-            # 1. CLIP-T: sigmoid映射到[0,1]
-            norm_clip_t = torch.sigmoid(clip_t_arr)
-            # 2. CLIP-F, CLIP-V: [-1,1] -> [0,1]
-            norm_clip_f = (clip_f_arr + 1.0) / 2.0
             norm_clip_v = (clip_v_arr + 1.0) / 2.0
 
-            # 合成unified reward
-            clip_reward = W_T * norm_clip_t + W_F * norm_clip_f + W_V * norm_clip_v
-            clip_reward = clip_reward.clamp(0.0, 1.0)  # [B]
-
             # 返回[B, 1]，与gt_reward一致
-            clip_reward = clip_reward.view(-1, 1)  # [B, 1]
+            clip_reward = norm_clip_v.view(-1, 1)  # [B, 1]
 
-            # # 打印shape确认
-            # print("="*100)
-            # print("norm_clip_t", norm_clip_t)
-            # print("norm_clip_f", norm_clip_f)
-            # print("norm_clip_v", norm_clip_v)
-            # print("clip_reward", clip_reward)
-            # print("clip_reward.shape", clip_reward.shape)
-            # print("="*100)
-
-            # 如果需要numpy输出，可: return clip_reward.cpu().numpy()
             return clip_reward
         finally:
             _release_modules(scorer)
@@ -532,7 +444,9 @@ def clip_score(device):
 def pickscore_score(device):
     from flow_grpo.pickscore_scorer import PickScoreScorer
 
-    def _fn(output_video, gt_video, prompts):
+    def _fn(output_video, gt_video, prompts, cam_extrinsics=None):
+        # 打印确认传入的参数格式
+        print(f"[pickscore_score] output_video 类型: {type(output_video)}, gt_video: {gt_video}, cam_extrinsics 类型: {type(cam_extrinsics)}")
         scorer = PickScoreScorer(dtype=torch.float32, device=device)
         try:
             # 参照gt_reward，处理B, C, T, H, W视频输入
@@ -573,26 +487,504 @@ def pickscore_score(device):
     return _fn
 
 
+def cam_score(device, api_url=None, base_port=34567):
+    """
+    Camera pose estimation reward using DepthAnything3 API.
+    Supports multi-node multi-GPU setup where each GPU has its own API server.
+    
+    Args:
+        device: Device (not directly used, kept for interface consistency)
+        api_url: URL of the DA3 API server (if None, auto-detects based on LOCAL_RANK)
+        base_port: Base port number for API servers (default: 34567, actual port = base_port + LOCAL_RANK)
+                   On each node, GPU 0 uses base_port, GPU 1 uses base_port+1, etc.
+    
+    Returns:
+        Function that evaluates camera pose accuracy and returns scores in [0, 5] range.
+    """
+    import requests
+    import json
+    import tempfile
+    import os
+    import numpy as np
+    
+    # Auto-detect API URL based on LOCAL_RANK (local GPU index on current node)
+    # LOCAL_RANK is the local GPU index (0-7) on each node, not the global RANK (0-31)
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is None:
+        # Fallback: try to extract GPU index from device string if available
+        if isinstance(device, (str, torch.device)):
+            device_str = str(device)
+            if ':' in device_str:
+                try:
+                    local_rank = int(device_str.split(':')[-1])
+                except ValueError:
+                    assert False, f"[cam_score] Error: Failed to extract LOCAL_RANK from device string: {device_str}"
+            else:
+                assert False, f"[cam_score] Error: Failed to extract LOCAL_RANK from device string: {device}"
+        else:
+            assert False, f"[cam_score] Error: Failed to extract LOCAL_RANK from device string: {device}"
+    else:
+        local_rank = int(local_rank)
+    
+    port = base_port + local_rank
+    api_url = f"http://localhost:{port}/evaluate_pose"
+    print(f"[cam_score] Auto-detected LOCAL_RANK {local_rank}, using API URL: {api_url}")
+    
+    # Store base URL (without endpoint) for load/unload model calls
+    base_url = api_url.replace('/evaluate_pose', '')
+    load_model_url = f"{base_url}/load_model"
+    unload_model_url = f"{base_url}/unload_model"
+    
+    def _tensor_to_json_format(cam_extrinsics_tensor, num_frames=21):
+        """
+        Convert cam_extrinsics tensor [21, 12] to JSON format matching camera_extrinsics.json.
+        
+        Args:
+            cam_extrinsics_tensor: torch.Tensor of shape [21, 12] or [batch_size, 21, 12]
+            num_frames: Number of frames (default: 21)
+        
+        Returns:
+            dict: JSON structure matching camera_extrinsics.json format
+        """
+        cam_extrinsics_tensor = cam_extrinsics_tensor.detach().cpu().float().numpy()
+        
+        # Convert [21, 12] to [21, 3, 4] (3x4 matrices)
+        cam_extrinsics_reshaped = cam_extrinsics_tensor.reshape(num_frames, 3, 4)
+        
+        # Build JSON structure: {"frame0": "[...]", "frame1": "[...]", ...}
+        json_data = {}
+        for frame_idx in range(num_frames):
+            frame_key = f"frame{frame_idx}"
+            
+            # Convert 3x4 matrix to string format matching camera_extrinsics.json
+            # Format: "[r11 r12 r13 t1] [r21 r22 r23 t2] [r31 r32 r33 t3] [0 0 0 1]"
+            matrix_3x4 = cam_extrinsics_reshaped[frame_idx]  # [3, 4]
+            
+            # Create 4x4 matrix by adding [0, 0, 0, 1] row
+            matrix_4x4 = np.zeros((4, 4), dtype=np.float32)
+            matrix_4x4[:3, :] = matrix_3x4
+            matrix_4x4[3, 3] = 1.0
+            
+            # Format as string: "[r11 r12 r13 t1] [r21 r22 r23 t2] [r31 r32 r33 t3] [0 0 0 1]"
+            row_strings = []
+            for row_idx in range(4):
+                row = matrix_4x4[row_idx]
+                row_str = " ".join([f"{val:.10g}" for val in row])
+                row_strings.append(f"[{row_str}]")
+            
+            # Join rows with space
+            matrix_str = " ".join(row_strings) + " "
+            
+            # Store directly: {"frame0": "[...]", "frame1": "[...]", ...}
+            json_data[frame_key] = matrix_str
+        
+        return json_data
+    
+    def _fn(output_video, gt_video, prompts, cam_extrinsics=None):
+        """
+        Evaluate camera pose estimation accuracy.
+        
+        Args:
+            output_video: List of video file paths or torch.Tensor [B, C, T, H, W]
+            gt_video: Not used (kept for interface consistency)
+            prompts: List of prompts (not used for pose estimation)
+            cam_extrinsics: torch.Tensor of shape [batch_size, 21, 12] or [21, 12]
+        
+        Returns:
+            dict: {
+                'scores': List of scores in [0, 5] range,
+                'details': {
+                    'rot_err': List of rotation errors,
+                    'trans_err': List of translation errors,
+                    'raw_rot_err': List of raw rotation errors (before normalization),
+                    'raw_trans_err': List of raw translation errors (before clipping)
+                }
+            }
+        """
+        # cam_extrinsics is required for camera pose evaluation
+        assert cam_extrinsics is not None, "cam_extrinsics is required for cam_score evaluation"
+        
+        # Handle video input: could be list of paths or tensor
+        video_paths = output_video
+        batch_size = len(video_paths)
+        
+        # Handle cam_extrinsics: could be [batch_size, 21, 12] or [21, 12]
+        # print(f"[cam_score] cam_extrinsics 类型: {type(cam_extrinsics)}, cam_extrinsics.shape: {cam_extrinsics.shape}")
+        
+        # Ensure batch_size matches
+        assert cam_extrinsics.shape[0] == batch_size, f"[cam_score] Warning: cam_extrinsics batch size {cam_extrinsics.shape[0]} != video batch size {batch_size}"
+        
+        # 延迟加载：在计算前加载模型到显存
+        # 直接调用load_model端点，服务器端会检查模型是否已加载，避免重复加载
+        try:
+            print(f"[cam_score] Loading model on server (port {port})...")
+            load_response = requests.post(load_model_url, timeout=300)  # Model loading can take time
+            load_response.raise_for_status()
+            load_result = load_response.json()
+            # print(f"[cam_score] Model load response: {load_result}")
+        except requests.exceptions.RequestException as e:
+            print(f"[cam_score] Warning: Failed to load model, will auto-load on first request: {e}")
+        
+        scores = []
+        rot_errs = []
+        trans_errs = []
+        raw_rot_errs = []
+        raw_trans_errs = []
+        
+        for video_idx in range(batch_size):
+            video_path = video_paths[video_idx]
+            
+            # Extract camera extrinsics for this video
+            # [batch_size, 21, 12] -> [21, 12]
+            cam_ext = cam_extrinsics[video_idx]
+            
+            # Convert cam_extrinsics to JSON format (expects [21, 12])
+            json_data = _tensor_to_json_format(cam_ext, num_frames=21)
+            
+            # Call API with JSON data directly (no need to save file)
+            try:
+                payload = {
+                    "video_path": video_path,
+                    "gt_json_data": json_data
+                }
+                
+                response = requests.post(api_url, json=payload, timeout=300)
+                response.raise_for_status()
+                
+                # 打印原始 response 内容
+                print(f"[cam_score] ========== Raw API Response (port {port}) ==========")
+                print(f"[cam_score] Status Code: {response.status_code}")
+                print(f"[cam_score] Headers: {dict(response.headers)}")
+                print(f"[cam_score] Raw Text: {response.text}")
+                print(f"[cam_score] ==================================================")
+                
+                result = response.json()
+                
+                rot_err_mean = float(result['rot_err_mean'])
+                trans_err_mean = float(result['trans_err_mean'])
+                
+                # Store raw errors before any processing
+                raw_rot_errs.append(rot_err_mean)
+                raw_trans_errs.append(trans_err_mean)
+                
+                # Handle TransErr > 30: 
+                # According to requirements: if all frames have TransErr > 30, set to 30
+                # Since API returns mean, we assume API has already filtered frames with TransErr > 30
+                # If the mean is still > 30, it means all frames were > 30, so we clip to 30
+                if trans_err_mean > 30:
+                    print(f"[cam_score] Warning: TransErr {trans_err_mean:.2f} > 30 for video {video_idx}, clipping to 30 (assuming all frames were filtered)")
+                    trans_err_mean = 30.0
+                
+                trans_errs.append(trans_err_mean)
+                rot_errs.append(rot_err_mean)
+                
+            except requests.exceptions.RequestException as e:
+                assert False, f"[cam_score] Error calling API for video {video_idx}: {e}"
+                # On error, set to maximum penalty
+                rot_err_mean = 5.0  # Maximum rotation error (rad)
+                trans_err_mean = 30.0  # Maximum translation error
+                raw_rot_errs.append(rot_err_mean)
+                raw_trans_errs.append(trans_err_mean)
+                rot_errs.append(rot_err_mean)
+                trans_errs.append(trans_err_mean)
+        
+        # Convert errors to scores in [0, 5] range
+        # Strategy based on observed data:
+        # - RotErr: strictly in [0, 1] range, map directly: rot_score = 5 * (1 - rot_err)
+        #   (error=0 → score=5, error=1 → score=0)
+        # - TransErr: mainly in [0, 2], occasionally larger values
+        #   Use robust piecewise mapping: linear in [0, 2], fast decay for >2
+        # - Combine: weighted average with equal weights
+        
+        # RotErr mapping: direct linear mapping from [0, 1] to [5, 0]
+        # rot_err = 0 → score = 5 (perfect)
+        # rot_err = 1 → score = 0 (worst)
+        # Formula: rot_score = 5 * (1 - rot_err)
+        
+        # TransErr mapping: robust piecewise mapping
+        # - Normal range [0, 2]: linear mapping trans_score = 5 * (1 - trans_err / 2)
+        #   trans_err = 0 → score = 5 (perfect)
+        #   trans_err = 2 → score = 0 (worst in normal range)
+        # - Abnormal range (>2): fast exponential decay to handle outliers
+        #   Use a very small scale factor to ensure scores are near-zero but maintain
+        #   some distinguishability for different outlier values
+        #   Formula: trans_score = max(0, epsilon * exp(-(trans_err - 2) / decay_factor))
+        #   where epsilon is very small (e.g., 0.1) to ensure rapid decay
+        trans_err_normal_max = 2.0  # Normal range maximum
+        trans_err_decay_factor = 0.3  # Decay factor for exponential decay (smaller = faster decay)
+        trans_err_outlier_scale = 0.1  # Small scale factor for outlier range to maintain distinguishability
+        
+        # Calculate scores for each error type, then combine
+        for rot_err, trans_err in zip(rot_errs, trans_errs):
+            # RotErr score: direct linear mapping
+            # Clamp rot_err to [0, 1] to handle any edge cases
+            rot_err_clamped = max(0.0, min(1.0, rot_err))
+            rot_score = 5.0 * (1.0 - rot_err_clamped)
+            
+            # TransErr score: robust piecewise mapping
+            if trans_err <= trans_err_normal_max:
+                # Normal range [0, 2]: linear mapping
+                # trans_err = 0 → score = 5, trans_err = 2 → score = 0
+                trans_score = 5.0 * (1.0 - trans_err / trans_err_normal_max)
+            else:
+                # Abnormal range (>2): fast exponential decay with small scale
+                # Use exponential decay to maintain distinguishability while being robust
+                # At trans_err=2, we want score ≈ 0 (close to linear part's 0)
+                # For trans_err > 2, score decays rapidly but remains slightly positive
+                # This allows some distinguishability while being robust to outliers
+                excess = trans_err - trans_err_normal_max
+                decay = math.exp(-excess / trans_err_decay_factor)
+                # Use small scale factor to ensure scores are very small (near-zero)
+                # but still maintain some distinguishability for different outlier values
+                # At trans_err=2.5: score ≈ 0.1 * exp(-0.5/0.3) ≈ 0.1 * 0.19 ≈ 0.019
+                # At trans_err=3.0: score ≈ 0.1 * exp(-1.0/0.3) ≈ 0.1 * 0.036 ≈ 0.0036
+                # At trans_err=4.0: score ≈ 0.1 * exp(-2.0/0.3) ≈ 0.1 * 0.0013 ≈ 0.00013
+                trans_score = max(0.0, trans_err_outlier_scale * decay)
+            
+            # Ensure scores are in [0, 5] range
+            rot_score = max(0.0, min(5.0, rot_score))
+            trans_score = max(0.0, min(5.0, trans_score))
+            
+            # Combine scores: weighted average (equal weights)
+            # This gives a score in [0, 5] range where 5 is best and 0 is worst
+            combined_score = (rot_score + trans_score) / 2.0
+            combined_score = max(0.0, min(5.0, combined_score))  # Clamp to [0, 5]
+            scores.append(combined_score)
+        
+        # 计算完成后释放模型显存
+        try:
+            print(f"[cam_score] Unloading model from server (port {port}) to free GPU memory...")
+            unload_response = requests.post(unload_model_url, timeout=60)
+            unload_response.raise_for_status()
+            # unload_result = unload_response.json()
+            # print(f"[cam_score] Model unload response: {unload_result}")
+        except requests.exceptions.RequestException as e:
+            print(f"[cam_score] Warning: Failed to unload model: {e}")
+        
+        return {
+            'scores': scores,
+            'details': {
+                'rot_err': rot_errs,
+                'trans_err': trans_errs,
+                'raw_rot_err': raw_rot_errs,
+                'raw_trans_err': raw_trans_errs
+            }
+        }
+    
+    return _fn
+
+
+def unifiedscore(device, api_url=None, base_port=34575):
+    """
+    UnifiedReward-Think-qwen3vl-8b video quality evaluation using API server.
+    Supports multi-node multi-GPU setup where each GPU has its own API server.
+    
+    Args:
+        device: Device (not directly used, kept for interface consistency)
+        api_url: URL of the Qwen3VL API server (if None, auto-detects based on LOCAL_RANK)
+        base_port: Base port number for API servers (default: 34575, actual port = base_port + LOCAL_RANK)
+                   On each node, GPU 0 uses base_port, GPU 1 uses base_port+1, etc.
+    
+    Returns:
+        Function that evaluates video quality and returns scores in [0, 1] range (normalized from [1.0, 5.0]).
+    """
+    import requests
+    import re
+    import os
+    
+    # Auto-detect API URL based on LOCAL_RANK (local GPU index on current node)
+    # LOCAL_RANK is the local GPU index (0-7) on each node, not the global RANK (0-31)
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is None:
+        # Fallback: try to extract GPU index from device string if available
+        if isinstance(device, (str, torch.device)):
+            device_str = str(device)
+            if ':' in device_str:
+                try:
+                    local_rank = int(device_str.split(':')[-1])
+                except ValueError:
+                    assert False, f"[unifiedscore] Error: Failed to extract LOCAL_RANK from device string: {device_str}"
+            else:
+                assert False, f"[unifiedscore] Error: Failed to extract LOCAL_RANK from device string: {device}"
+        else:
+            assert False, f"[unifiedscore] Error: Failed to extract LOCAL_RANK from device string: {device}"
+    else:
+        local_rank = int(local_rank)
+    
+    port = base_port + local_rank
+    api_url = f"http://localhost:{port}/evaluate_video"
+    print(f"[unifiedscore] Auto-detected LOCAL_RANK {local_rank}, using API URL: {api_url}")
+    
+    # Store base URL (without endpoint) for load/unload model calls
+    base_url = api_url.replace('/evaluate_video', '')
+    load_model_url = f"{base_url}/load_model"
+    unload_model_url = f"{base_url}/unload_model"
+    
+    def extract_answer(text):
+        """
+        从文本中提取 <answer> 标签中的内容
+        仿照 api_request_qwen3vl.py 中的实现
+        """
+        pattern = r'<answer>(.*?)</answer>'
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return None
+    
+    def _fn(output_video, gt_video, prompts, cam_extrinsics=None):
+        """
+        Evaluate video quality using UnifiedReward-Think-qwen3vl-8b model.
+        
+        Args:
+            output_video: List of video file paths
+            gt_video: Not used (kept for interface consistency)
+            prompts: List of prompts describing the video content
+            cam_extrinsics: Not used (kept for interface consistency)
+        
+        Returns:
+            dict: {
+                'scores': List of scores in [0, 1] range (normalized from [1.0, 5.0]),
+                'details': {
+                    'raw_scores': List of raw scores in [1.0, 5.0] range,
+                    'output_texts': List of raw output texts from the model
+                }
+            }
+        """
+        # Handle video input: should be list of paths
+        video_paths = output_video
+        prompt_list = prompts
+        batch_size = len(video_paths)
+        
+        # Ensure batch sizes match
+        assert len(prompt_list) == batch_size, f"[unifiedscore] Warning: prompts batch size {len(prompt_list)} != video batch size {batch_size}"
+        
+        # 延迟加载：在计算前加载模型到显存
+        # 直接调用load_model端点，服务器端会检查模型是否已加载，避免重复加载
+        try:
+            print(f"[unifiedscore] Loading model on server (port {port})...")
+            load_response = requests.post(load_model_url, timeout=300)  # Model loading can take time
+            load_response.raise_for_status()
+            load_result = load_response.json()
+            # print(f"[unifiedscore] Model load response: {load_result}")
+        except requests.exceptions.RequestException as e:
+            print(f"[unifiedscore] Warning: Failed to load model, will auto-load on first request: {e}")
+        
+        scores = []
+        raw_scores = []
+        output_texts = []
+        
+        for video_idx in range(batch_size):
+            video_path = video_paths[video_idx]
+            prompt = prompt_list[video_idx]
+            
+            # Call API - 仿照 api_request_qwen3vl.py 的请求方式
+            payload = {
+                "video_path": video_path,
+                "prompt": prompt,
+                "fps": 30.0  # Default FPS
+            }
+            
+            # 使用 while True 循环，确保成功提取分数后才退出
+            # 在实际使用中，如果第一次就成功，会立即 break
+            max_retries = 3  # 最多重试3次
+            retry_count = 0
+            success = False
+            
+            while retry_count < max_retries and not success:
+                try:
+                    response = requests.post(api_url, json=payload, timeout=600)  # Video evaluation can take time
+                    response.raise_for_status()
+                    
+                    result = response.json()
+                    output_text = result.get('output_text', '')
+                    
+                    # 打印完整结果（用于调试）
+                    print(f"\n[unifiedscore] Video {video_idx} - Full Evaluation Result:")
+                    print(output_text)
+                    
+                    # 提取并解析分数
+                    raw_score = extract_answer(output_text)
+                    if raw_score:
+                        try:
+                            score = float(raw_score)
+                            scores.append(score)
+                            success = True
+                            break
+                        except ValueError:
+                            print(f"[unifiedscore] Warning: Could not convert answer content to float: {raw_score}")
+        
+                    
+                    # 未能提取到分数，重试
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        print(f"[unifiedscore] Warning: Could not extract score from response, retrying ({retry_count}/{max_retries})...")
+                    else:
+                        print(f"[unifiedscore] Error: Failed to extract score after {max_retries} attempts")
+                        # 使用默认最低分数
+                        output_texts.append(output_text)
+                        raw_scores.append(1.0)  # Minimum score
+                        scores.append(0.0)  # Minimum normalized score
+                        success = True  # 标记为完成，避免继续重试
+                        
+                except requests.exceptions.RequestException as e:
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        print(f"[unifiedscore] Error calling API for video {video_idx} (attempt {retry_count}/{max_retries}): {e}")
+                        print(f"[unifiedscore] Retrying...")
+                    else:
+                        print(f"[unifiedscore] Error calling API for video {video_idx} after {max_retries} attempts: {e}")
+                        # On error, set to minimum score
+                        raw_score = 1.0  # Minimum score
+                        normalized_score = 0.0  # Minimum normalized score
+                        raw_scores.append(raw_score)
+                        scores.append(normalized_score)
+                        output_texts.append(f"Error: {str(e)}")
+                        success = True  # 标记为完成，避免继续重试
+        
+        # 计算完成后释放模型显存
+        try:
+            print(f"[unifiedscore] Unloading model from server (port {port}) to free GPU memory...")
+            unload_response = requests.post(unload_model_url, timeout=60)
+            unload_response.raise_for_status()
+            # unload_result = unload_response.json()
+            # print(f"[unifiedscore] Model unload response: {unload_result}")
+        except requests.exceptions.RequestException as e:
+            print(f"[unifiedscore] Warning: Failed to unload model: {e}")
+        
+        # 只返回数值类型的 details，移除字符串类型（output_texts）以适配 multi_score 接口
+        # output_texts 仅用于内部调试，不传递到训练流程
+        return {
+            'scores': scores,  # List[float], shape: [batch_size]
+            'details': {
+                'raw_scores': raw_scores,  # List[float], shape: [batch_size], 原始分数 [1.0, 5.0]
+            }
+        }
+    
+    return _fn
+
+
 def multi_score(device, score_dict):
     score_functions = {
         "video_ocr": video_ocr_score,
         "imagereward": imagereward_score,
-        "qwenvl": qwenvl_score,
         "unifiedreward": unifiedreward_score_sglang,
-        "clip_score": clip_score,
+        "clip_v_score": clip_v_score,
         "pick_score": pickscore_score,
         "my_reward": my_reward,
         "optical_reward": optical_reward,
         "gt_reward": gt_reward,
+        "cam_score": cam_score,
+        "unifiedscore": unifiedscore,
     }
     score_fns={}
     for score_name, weight in score_dict.items():
         score_fns[score_name] = score_functions[score_name](device) if 'device' in score_functions[score_name].__code__.co_varnames else score_functions[score_name]()
 
     # During training, only the strict reward is needed, and non-strict rewards don't need to be computed, reducing reward calculation time.
-    def _fn(output_video, gt_video, prompts):
+    def _fn(output_video, gt_video, prompts, cam_extrinsics=None):        
         total_scores = []
         score_details = {}
+        score_sub_details = {}  # 存储每个reward函数的详细指标
         score_items = list(score_dict.items())
         for score_name, weight in tqdm(
             score_items,
@@ -604,7 +996,15 @@ def multi_score(device, score_dict):
             # print("当前计算的奖励是：", score_name)
             # print("传入的类型output_video.device", output_video.device)
             # print("传入的类型gt_video.device", gt_video.device)
-            scores = score_fns[score_name](output_video, gt_video, prompts)
+            result = score_fns[score_name](output_video, gt_video, prompts, cam_extrinsics)
+            
+            scores = result['scores']
+            if 'details' in result and result['details']:
+                # 存储详细指标，键名为 score_name_sub_metric_name
+                for sub_metric_name, sub_values in result['details'].items():
+                    detail_key = f"{score_name}_{sub_metric_name}"
+                    score_sub_details[detail_key] = sub_values
+            
             score_details[score_name] = scores
             weighted_scores = [weight * score for score in scores]
             
@@ -614,6 +1014,8 @@ def multi_score(device, score_dict):
                 total_scores = [total + weighted for total, weighted in zip(total_scores, weighted_scores)]
         
         score_details['avg'] = total_scores
+        # 将详细指标合并到score_details中
+        score_details.update(score_sub_details)
         return score_details
 
     return _fn

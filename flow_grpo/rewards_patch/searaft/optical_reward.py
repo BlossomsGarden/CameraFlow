@@ -1,26 +1,40 @@
 # GT
 # === Reward Results ===
-# Total Reward: 0.7058
+# Total Reward: 0.9073
 
 # Detailed Components:
-#   temporal_consistency: 0.5881
+#   temporal_consistency: 0.3820
 #   visual_quality: 1.0000
 #   flow_ssim: 1.0000
-#   endpoint_error: 0.0000
-#   total_reward: 0.7058
-# Time taken: 41.19 seconds
+#   endpoint_similarity: 1.0000
+#   total_reward: 0.9073
+# Time taken: 29.91 seconds
 
 # cam02
 # === Reward Results ===
-# Total Reward: -1.6498
+# Total Reward: 0.1863
 
 # Detailed Components:
-#   temporal_consistency: 0.5884
-#   visual_quality: 0.0007
-#   flow_ssim: 0.6708
-#   endpoint_error: 13.0443
-#   total_reward: -1.6498
-# Time taken: 41.34 seconds
+#   temporal_consistency: 0.4729
+#   visual_quality: 0.0034
+#   flow_ssim: 0.7609
+#   endpoint_similarity: 0.0000
+#   total_reward: 0.1863
+# Time taken: 29.47 seconds
+
+# cam 03
+# === Reward Results ===
+# Total Reward: 0.3315
+
+# Detailed Components:
+#   temporal_consistency: 0.3895
+#   visual_quality: 0.4524
+#   flow_ssim: 0.7646
+#   endpoint_similarity: 0.0000
+#   total_reward: 0.3315
+# Time taken: 29.45 seconds
+
+
 
 
 
@@ -192,9 +206,15 @@ class CameraControlRewardSystem:
 
         return (np.mean(rewards)+1)/2
     
-    def compute_endpoint_error(self, output_target_video, gt_target_video):
+    def compute_endpoint_error(self, output_target_video, gt_target_video, normalize=True, scale=5.0):
         """
         计算生成视频与GT视频之间的平均Endpoint Error (EPE)
+        
+        Args:
+            output_target_video: 生成的视频
+            gt_target_video: GT视频
+            normalize: 是否归一化EPE到[0,1]范围
+            scale: 归一化时的缩放因子，用于控制归一化曲线的陡峭程度
         """
         output_target_video = self._ensure_time_first(output_target_video)
         gt_target_video = self._ensure_time_first(gt_target_video)
@@ -204,6 +224,8 @@ class CameraControlRewardSystem:
             return float('nan')
         
         epe_values = []
+        gt_flow_magnitudes = []
+        
         for i in range(total_frames - 1):
             gen_f1 = output_target_video[i:i+1].to(self.device)
             gen_f2 = output_target_video[i+1:i+2].to(self.device)
@@ -216,8 +238,34 @@ class CameraControlRewardSystem:
             diff = gen_flow - gt_flow
             epe = torch.norm(diff, dim=1).mean()
             epe_values.append(epe.item())
+            
+            # 计算GT光流的幅度，用于相对归一化
+            if normalize:
+                gt_flow_mag = torch.norm(gt_flow, dim=1).mean()
+                gt_flow_magnitudes.append(gt_flow_mag.item())
         
-        return float(np.mean(epe_values)) if epe_values else float('nan')
+        raw_epe = float(np.mean(epe_values)) if epe_values else float('nan')
+        
+        if not normalize or np.isnan(raw_epe):
+            return raw_epe
+        
+        # 归一化方法1: 基于GT光流幅度的相对归一化
+        # 将EPE相对于GT光流幅度进行归一化，然后映射到[0,1]范围
+        if gt_flow_magnitudes:
+            avg_gt_flow_mag = np.mean(gt_flow_magnitudes)
+            if avg_gt_flow_mag > 1e-6:
+                relative_epe = raw_epe / (avg_gt_flow_mag + 1e-6)
+                # 使用1-exp(-x)函数将相对EPE映射到[0,1)，保持误差语义（值越大误差越大）
+                # scale控制归一化曲线的陡峭程度，scale越大曲线越平缓
+                normalized_epe = 1.0 - np.exp(-relative_epe * scale)
+                return normalized_epe
+        
+        # 归一化方法2: 直接使用固定scale的指数衰减归一化（fallback）
+        # 使用1-exp(-x/scale)将原始EPE映射到[0,1)，保持误差语义
+        # 当epe=0时，normalized_epe=0（完美匹配）
+        # 当epe很大时，normalized_epe接近1（误差很大）
+        normalized_epe = 1.0 - np.exp(-raw_epe / scale)
+        return normalized_epe
 
     def compute_flow_ssim(self, output_target_video, gt_target_video):
         """
@@ -327,22 +375,23 @@ class CameraControlRewardSystem:
         """
         
         if weights is None:
-            weights = {'temporal': 0.15, 'quality': 0.35, 'epe': 0.35, 'flow_ssim': 0.15}
+            # weights = {'temporal': 0.15, 'quality': 0.35, 'flow_ssim': 0.15, 'epe': 0.35}
+            weights = {'temporal': 0.3, 'quality': 0.35, 'flow_ssim': 0.35}
         
         # 计算各分量reward
         temporal_reward = self.compute_temporal_consistency(output_target_video)
         quality_reward = self.compute_visual_quality_reward(output_target_video, gt_target_video)
-        epe_metric = self.compute_endpoint_error(output_target_video, gt_target_video)
+        # epe_similarity = 1.0 -self.compute_endpoint_error(output_target_video, gt_target_video)
         flow_ssim_metric = self.compute_flow_ssim(output_target_video, gt_target_video)
         
-        # 加权组合
-        total_reward = weights['temporal'] * temporal_reward +weights['quality'] * quality_reward +weights['flow_ssim'] * flow_ssim_metric - weights['epe'] * epe_metric
-        
+        # 加权组合（所有指标都是越大越好，直接相加）
+        # total_reward = weights['temporal'] * temporal_reward + weights['quality'] * quality_reward + weights['flow_ssim'] * flow_ssim_metric + weights['epe'] * epe_similarity
+        total_reward = weights['temporal'] * temporal_reward + weights['quality'] * quality_reward + weights['flow_ssim'] * flow_ssim_metric
         reward_components = {
             'temporal_consistency': temporal_reward,
             'visual_quality': quality_reward,
             'flow_ssim': flow_ssim_metric,
-            'endpoint_error': epe_metric,
+            # 'endpoint_similarity': epe_similarity,  # 相似度值（越大越好）
             'total_reward': total_reward
         }
         
@@ -485,28 +534,92 @@ def optical_eval(output_target_video, gt_target_video, min_frames=81, device='np
     )
     
     # 输出结果
-    # print("\n=== Reward Results ===")
-    # print(f"Total Reward: {total_reward:.4f}")
-    # print("\nDetailed Components:")
-    # for component, value in reward_components.items():
-    #     print(f"  {component}: {value:.4f}")
+    print("\n=== Reward Results ===")
+    print(f"Total Reward: {total_reward:.4f}")
+    print("\nDetailed Components:")
+    for component, value in reward_components.items():
+        print(f"  {component}: {value:.4f}")
     
-    # timestamp = time.time() - timestamp
-    # print(f"Time taken: {timestamp:.2f} seconds")
+    timestamp = time.time() - timestamp
+    print(f"Time taken: {timestamp:.2f} seconds")
 
     return float(total_reward)
+
+
+def optical_eval_with_details(output_target_video, gt_target_video, min_frames=81, device='npu', video_layout = "cthw", model=None, reward_system=None):
+    """
+    与optical_eval相同，但返回详细指标
+    返回: (total_reward, reward_components)
+    """
+    # 初始化参数和模型
+    args = SPRING_ARGS
+    device = torch.device(device)
+    
+    # 如果模型未提供，则创建新模型（用于向后兼容）
+    if model is None:
+        # 加载光流模型
+        model = RAFT(args)
+        load_ckpt(model, '/home/ma-user/modelarts/user-job-dir/wlh/Model/SeaRaft/Tartan-C-T-TSKH-spring540x960-M.pth')
+        # 同步设备操作，避免NPU设备冲突
+        if hasattr(torch, 'npu') and torch.npu.is_available():
+            torch.npu.synchronize()
+        model = model.to(device)
+        if hasattr(torch, 'npu') and torch.npu.is_available():
+            torch.npu.synchronize()
+        model.eval()
+    
+    # 如果reward系统未提供，则创建新的（用于向后兼容）
+    if reward_system is None:
+        reward_system = CameraControlRewardSystem(args, model, device, video_layout=video_layout)
+    
+    # 加载源视频
+    source_video = None     # 暂时不用原视频
+    camera_extrinsics = None    #暂时不用相机外参
+
+    frame_axis = 1 if video_layout == "cthw" else 0
+    max_available_frames = min(
+        min_frames,
+        output_target_video.shape[frame_axis],
+        gt_target_video.shape[frame_axis]
+    )
+
+    if frame_axis == 1:
+        output_target_video = output_target_video[:, :max_available_frames]
+        gt_target_video = gt_target_video[:, :max_available_frames]
+    else:
+        output_target_video = output_target_video[:max_available_frames]
+        gt_target_video = gt_target_video[:max_available_frames]
+    
+    timestamp = time.time()
+    # 计算reward
+    total_reward, reward_components = reward_system.compute_total_reward(
+        source_video=source_video,
+        target_camera_extrinsics=camera_extrinsics,
+        output_target_video=output_target_video,
+        gt_target_video=gt_target_video
+    )
+    
+    return float(total_reward), reward_components
     
 
 # 如果直接运行这个文件
 if __name__ == "__main__":
     # 加载生成的target video
-    output_target_video = load_video_frames("output_video_cam01.mp4")
+    output_target_video = load_video_frames("cam03.mp4")
     print(f"Output target video loaded: {output_target_video.shape}")
 
     # 加载GT target video
-    gt_target_video = load_video_frames("GT_video_cam01.mp4")
+    gt_target_video = load_video_frames("GT_cam01.mp4")
     print(f"GT target video loaded: {gt_target_video.shape}")
 
-    # 注意这里的load_tensor和recam代码里的格式不一样，这里的是[T, C, H, W]，recam代码里的是[C, T, H, W]
-    reward = optical_eval(output_target_video, gt_target_video, min_frames=81, device='npu', video_layout="tchw")
-    print(f"Reward: {reward:.4f}")
+    # 注意这里的load_video_frames返回的是[T, C, H, W]格式，与recam代码里的[C, T, H, W]格式不同
+    # 所以使用 video_layout="tchw" 来匹配 [T, C, H, W] 格式
+    print("Computing optical reward...")
+    reward = optical_eval(
+        output_target_video, 
+        gt_target_video, 
+        min_frames=min(output_target_video.shape[0], gt_target_video.shape[0]), 
+        device='npu', 
+        video_layout="tchw"
+    )
+        

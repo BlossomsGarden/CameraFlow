@@ -289,8 +289,6 @@ class WanModel(torch.nn.Module):
         # 只会在load WAN DIT时切分一次
         self.freqs = precompute_freqs_cis_3d(head_dim)
 
-
-
     #########################################################################################
     # 将输入视频张量（通常是 B x C x T x H x W）切成小块（patch），并展平成 Transformer 友好的序列形式。
     # 同时返回每个轴上的 patch 数 (f, h, w)，方便后续为每个 token 生成对应的三维位置编码。
@@ -332,13 +330,12 @@ class WanModel(torch.nn.Module):
 
         x, (f, h, w) = self.patchify(x)
 
-        # 小张量拷贝 - 优化：一次性转换所有需要的freqs，减少设备间传输
-        # time_start = time.time()
-        f0 = self.freqs[0][:f].to(x.device) 
+        
+        torch.npu.synchronize()
+        f0 = self.freqs[0][:f].to(x.device)
         h0 = self.freqs[1][:h].to(x.device)
-        w0 = self.freqs[2][:w].to(x.device)
-        # time_end = time.time()
-        # print(f"freqs time: {time_end - time_start} seconds")
+        w0 = self.freqs[2][:w].to(x.device)    
+        torch.npu.synchronize()
 
         freqs = torch.cat([
             f0.view(f, 1, 1, -1).expand(f, h, w, -1),

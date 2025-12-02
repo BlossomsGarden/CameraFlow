@@ -428,11 +428,12 @@ def my_recam_8npu():
     config.width = 832
     config.num_frames = 81
     config.reward_fn = {
-        # "my_reward": 0.3,
-        "clip_score": 0.2,
-        "pick_score": 0.2,
-        "optical_reward": 0.3,
-        "gt_reward": 0.3,
+        # "my_reward": 0.2,
+        # "clip_v_score": 0.2,
+        # "optical_reward": 0.3,
+        # "gt_reward": 0.3,
+        "cam_score": 0.5,
+        "unifiedscore": 0.5,
     }
     config.dataset = "/home/ma-user/modelarts/user-job-dir/wlh/Data/MultiCamVideo-Dataset"
     
@@ -443,10 +444,10 @@ def my_recam_8npu():
     config.sample.num_steps = 30        # sampling denoising steps
     config.sample.eval_num_steps = 50   # SDE inference steps
     config.sample.guidance_scale=5.0    # CFG
-    config.sample.num_batches_per_epoch = 2     # 每个epoch里只采样2次batch
+    config.sample.num_batches_per_epoch = 4     # 每个epoch里只采样2次batch
 
     # A large num_epochs is intentionally set here. Training will be manually stopped once sufficient
-    config.num_epochs = 100000
+    config.num_epochs = 10000
     config.save_freq = 10 # epoch
     config.eval_freq = 10
 
