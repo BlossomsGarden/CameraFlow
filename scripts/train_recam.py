@@ -403,14 +403,14 @@ def calculate_zero_std_ratio(prompts, gathered_rewards):
     split_indices = np.cumsum(counts)[:-1]
     reward_groups = np.split(grouped_rewards, split_indices)
 
-    print("="*100)
-    print("unique_prompts", unique_prompts)
-    print("inverse_indices", inverse_indices)
-    print("counts", counts)
-    print("grouped_rewards", grouped_rewards)
-    print("split_indices", split_indices)
-    print("reward_groups", reward_groups)
-    print("="*100)
+    # print("="*100)
+    # print("unique_prompts", unique_prompts)
+    # print("inverse_indices", inverse_indices)
+    # print("counts", counts)
+    # print("grouped_rewards", grouped_rewards)
+    # print("split_indices", split_indices)
+    # print("reward_groups", reward_groups)
+    # print("="*100)
     
     # Calculate standard deviation for each group
     prompt_std_devs = np.array([np.std(group) for group in reward_groups])
@@ -478,6 +478,15 @@ def compute_log_prob_recam(
         use_gc_offload = getattr(config.train, "gradient_checkpointing_offload", False)
 
         torch.npu.synchronize()
+
+        # print("="*100)
+        # print("latents_input.shape", latents_input.shape)
+        # print("timestep_model.shape", timestep_model.shape)
+        # print("prompt_embeds.shape", prompt_embeds.shape)
+        # print("negative_prompt_embeds.shape", negative_prompt_embeds.shape)
+        # print("cam_emb.shape", cam_emb.shape)
+        # print("="*100)
+
         noise_pred_posi = transformer(
             x=latents_input,
             timestep=timestep_model,
@@ -577,7 +586,6 @@ def recam_pipeline_with_logprob(
     target_camera,
     num_inference_steps=50,
     guidance_scale=5.0,
-    output_type="tensor",
     height=480,
     width=832,
     num_frames=81,
@@ -770,228 +778,242 @@ def recam_pipeline_with_logprob(
     return videos, all_latents, all_log_probs
 
 
-def eval(pipeline, test_dataloader, test_neg_prompt_embed, config, accelerator, global_step, reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters, epoch):
+def eval(pipeline, test_dataloader, test_neg_prompt_embed, config, accelerator, global_step, reward_fn, executor, autocast, ema, transformer_trainable_parameters, epoch):
+    """
+    Evaluation function that mirrors the main training loop logic.
+    
+    Differences from training:
+    1. Uses test_dataloader instead of train_dataloader
+    2. Evaluates max_eval_samples (default 8) samples then stops
+    3. Only keeps videos from recam_pipeline_with_logprob (ignores latent_trajectory and log_probs)
+    4. No GRPO advantage computation, only reward calculation and saving
+    """
     if config.train.ema:
         ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
 
-    # 限制评估的样本数量以加快评估速度
-    max_eval_samples = getattr(config, 'max_eval_samples', 8)  # 默认评估8个样本
+    # Set model to eval mode
+    pipeline.dit.eval()
+    
+    # Clear cache for evaluation
+    torch.npu.empty_cache()
+    torch.npu.synchronize()
+
+    # Limit number of samples to evaluate for faster evaluation
+    max_eval_samples = getattr(config, 'max_eval_samples', 1)  # Default: 8 samples
     
     all_rewards = defaultdict(list)
-    last_batch_videos = None
-    last_batch_gt_videos = None     # <-- Keep gt_videos for saving
-    last_batch_prompts = None
-    last_batch_rewards = None
-    # last_batch_source_videos = None  # <-- Remove source video variable
+    all_video_paths = []  # Store all video paths for reward computation
+    all_prompts = []
+    all_reward_futures = []  # Store reward futures for async computation
     
-    total_evaluated_samples = 0  # 累计已评估的样本数量
+    total_evaluated_samples = 0
 
+    # Process test batches
     for test_batch in tqdm(
         test_dataloader,
         desc="Eval: ",
         disable=not accelerator.is_local_main_process,
         position=0,
     ):
-        # 如果已经评估了足够的样本，提前退出
+        # Check if we've evaluated enough samples
         if total_evaluated_samples >= max_eval_samples:
             break
-        # Note: the following print statements referenced all_latents before definition, move them later if needed
 
-        # collate_fn now returns (prompts, batch_data, dataset_indices)
-        # For eval, we only need prompts and batch_data
+        # Extract data from batch (same format as training loop)
         prompts, batch_data, _ = test_batch  # Ignore dataset_indices in eval
 
         # Extract ReCamMaster data: latents (concatenated target+condition) and camera
         all_latents = batch_data["latents"].to(accelerator.device)  # (batch_size, 16, 42, 60, 104)
-        target_cameras = batch_data["camera"].to(accelerator.device)  # (batch_size, 21, 12)
-
-        # Split target (gt) and source (condition) latents for source video decoding (not saved)
-        # source_latents = all_latents[:, :, 21:, ...]  # <-- Not used anymore
-
-        # The following block for decoding source videos is now removed
-
+        target_camera = batch_data["camera"].to(accelerator.device)  # (batch_size, 21, 12)
+        
         # Get prompt embeddings from batch_data (already encoded)
         # Remove the second dimension (index 1) to convert (batch_size, 1, seq_len, hidden_dim) -> (batch_size, seq_len, hidden_dim)
         prompt_embeds = batch_data["prompt_emb"]["context"].squeeze(1).to(accelerator.device)  # (batch_size, seq_len, hidden_dim)
 
-        # The last batch may not be full batch_size
+        # Limit current batch size to remaining samples needed
         batch_size = all_latents.shape[0]
-        
-        # 限制当前batch处理的样本数量，确保不超过max_eval_samples
         remaining_samples = max_eval_samples - total_evaluated_samples
         if remaining_samples <= 0:
             break
         
-        # 如果当前batch的样本数超过剩余需要的样本数，只处理需要的部分
         actual_batch_size = min(batch_size, remaining_samples)
         if actual_batch_size < batch_size:
-            # 只处理前actual_batch_size个样本
             all_latents = all_latents[:actual_batch_size]
-            target_cameras = target_cameras[:actual_batch_size]
+            target_camera = target_camera[:actual_batch_size]
             prompt_embeds = prompt_embeds[:actual_batch_size]
             prompts = prompts[:actual_batch_size] if isinstance(prompts, list) else prompts
-        
+
+        # Prepare negative prompt embeddings
         if actual_batch_size < test_neg_prompt_embed.shape[0]:
             current_neg_prompt_embeds = test_neg_prompt_embed[:actual_batch_size]
         else:
             current_neg_prompt_embeds = test_neg_prompt_embed
 
-        # Generate videos using recam_pipeline_with_logprob (same as sampling)
+        # Generate videos using recam_pipeline_with_logprob (same as training loop)
         with autocast():
             with torch.no_grad():
-                videos, gt_videos, _, _ = recam_pipeline_with_logprob(
+                videos, _, _ = recam_pipeline_with_logprob(
                     pipeline=pipeline,
                     prompt_embeds=prompt_embeds,
                     negative_prompt_embeds=current_neg_prompt_embeds,
                     all_latents=all_latents,
-                    target_camera=target_cameras,
+                    target_camera=target_camera,
                     num_inference_steps=config.sample.eval_num_steps,
                     guidance_scale=config.sample.guidance_scale,
-                    output_type="tensor",
                     height=config.height,
                     width=config.width,
                     num_frames=config.num_frames,
                 )
 
-        # Note: reward_fn should handle video input instead of images
-        rewards = executor.submit(reward_fn, videos, gt_videos, prompts)
-        # yield to to make sure reward computation starts
-        time.sleep(0)
-        rewards = rewards.result()
-        
-        for key, value in rewards.items():
-            rewards_gather = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
-            all_rewards[key].append(rewards_gather)
+        videos = videos.to(accelerator.device)
 
-        # 更新累计评估的样本数量
+        # Save videos to files (same pattern as training loop)
+        process_index = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+        eval_dir = os.path.join(
+            config.logdir if hasattr(config, 'logdir') else "./logs",
+            config.run_name if hasattr(config, 'run_name') else "eval",
+            f"epoch-{epoch}-eval"
+        )
+        # Create directory (may be created by multiple processes concurrently)
+        try:
+            os.makedirs(eval_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        # Save videos and collect paths
+        # Use rank and batch index in filename to avoid conflicts across processes
+        batch_idx = len(all_reward_futures)  # Current batch index
+        video_paths = []
+        for video_idx in range(actual_batch_size):
+            frames = pipeline.tensor2video(videos[video_idx])
+            save_path = os.path.join(eval_dir, f"output_video_rank{process_index}_batch{batch_idx}_sample{video_idx}.mp4")
+            save_video(frames, save_path, fps=20, quality=5)
+            video_paths.append(os.path.abspath(save_path))
+
+        # Async reward computation (same pattern as training loop)
+        rewards_future = executor.submit(reward_fn, video_paths, None, prompts, target_camera)
+        time.sleep(0)  # Ensure reward thread starts executing
+
+        # Store for later processing
+        all_video_paths.extend(video_paths)
+        all_prompts.extend(prompts if isinstance(prompts, list) else [prompts] * actual_batch_size)
+        all_reward_futures.append(rewards_future)
+
+        # Update counter
         total_evaluated_samples += actual_batch_size
 
-        # Save last batch for video saving
-        last_batch_videos = videos
-        last_batch_gt_videos = gt_videos     # <-- Save gt_videos
-        last_batch_prompts = prompts
-        last_batch_rewards = rewards
-        # last_batch_source_videos = source_videos   # <-- Remove
+        # Clean up intermediate variables
+        del videos, all_latents, target_camera, prompt_embeds
 
-    
-    # Handle case where no batches were processed
-    if last_batch_videos is None:
-        if accelerator.is_main_process:
-            logger.warning("No batches processed in eval, skipping video saving")
-        if config.train.ema:
-            ema.copy_temp_to(transformer_trainable_parameters)
-        return
+    # Wait for all rewards to be computed (same pattern as training loop)
+    all_rewards_dict = {}
+    for reward_future in tqdm(
+        all_reward_futures,
+        desc="Eval: waiting for rewards",
+        disable=not accelerator.is_local_main_process,
+        position=0,
+    ):
+        rewards = reward_future.result()
+        # Convert rewards to tensors and accumulate
+        for key, value in rewards.items():
+            if key not in all_rewards_dict:
+                all_rewards_dict[key] = []
+            if isinstance(value, (list, np.ndarray)):
+                all_rewards_dict[key].extend(value)
+            else:
+                all_rewards_dict[key].append(value)
 
-    # 关键修复：在gather之前再次同步，确保所有进程都到达这里
-    accelerator.wait_for_everyone()
-    
-    last_batch_videos_gather = accelerator.gather(torch.as_tensor(last_batch_videos, device=accelerator.device)).float().cpu().numpy()
-    # last_batch_source_videos_gather = accelerator.gather(torch.as_tensor(last_batch_source_videos, device=accelerator.device)).float().cpu().numpy()  # <-- Remove
-    last_batch_gt_videos_gather = accelerator.gather(torch.as_tensor(last_batch_gt_videos, device=accelerator.device)).float().cpu().numpy()  # <-- Gather gt_videos
+    # Convert to tensors for gathering
+    gathered_rewards = {}
+    for key, value in all_rewards_dict.items():
+        value_tensor = torch.as_tensor(value, device=accelerator.device).float()
+        gathered_rewards[key] = accelerator.gather(value_tensor).cpu().numpy()
 
-    # Gather prompts from all processes
-    # Use gather_object for string lists (requires accelerate >= 0.20.0)
-    # If not available, fall back to manual collection
+    # Gather prompts and video paths
     try:
-        last_batch_prompts_gather = accelerator.gather_object(last_batch_prompts if last_batch_prompts else [])
+        gathered_prompts = accelerator.gather_object(all_prompts if all_prompts else [])
         if accelerator.is_main_process:
-            # Flatten the list of lists
-            last_batch_prompts_gather = [p for prompt_list in last_batch_prompts_gather for p in prompt_list]
-            # Ensure length matches videos
-            if len(last_batch_prompts_gather) < len(last_batch_videos_gather):
-                last_batch_prompts_gather.extend([""] * (len(last_batch_videos_gather) - len(last_batch_prompts_gather)))
-            elif len(last_batch_prompts_gather) > len(last_batch_videos_gather):
-                last_batch_prompts_gather = last_batch_prompts_gather[:len(last_batch_videos_gather)]
+            gathered_prompts = [p for prompt_list in gathered_prompts for p in prompt_list]
     except (AttributeError, TypeError):
-        # Fallback: only use prompts from main process
         if accelerator.is_main_process:
-            last_batch_prompts_gather = last_batch_prompts if last_batch_prompts else [""] * len(last_batch_videos_gather)
-            if len(last_batch_prompts_gather) < len(last_batch_videos_gather):
-                last_batch_prompts_gather.extend([""] * (len(last_batch_videos_gather) - len(last_batch_prompts_gather)))
+            gathered_prompts = all_prompts
         else:
-            last_batch_prompts_gather = []
+            gathered_prompts = []
 
-    # 关键修复：在最后一个gather之前同步，确保所有进程都完成了前面的gather操作
-    accelerator.wait_for_everyone()
-    
-    last_batch_rewards_gather = {}
-    for key, value in last_batch_rewards.items():
-        last_batch_rewards_gather[key] = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
+    # Gather video paths
+    try:
+        gathered_video_paths = accelerator.gather_object(all_video_paths if all_video_paths else [])
+        if accelerator.is_main_process:
+            gathered_video_paths = [p for path_list in gathered_video_paths for p in path_list]
+    except (AttributeError, TypeError):
+        if accelerator.is_main_process:
+            gathered_video_paths = all_video_paths
+        else:
+            gathered_video_paths = []
 
-    all_rewards = {key: np.concatenate(value) for key, value in all_rewards.items()}
+    # Main process: save results and log to wandb
     if accelerator.is_main_process:
-        # Create eval directory for saving videos - use epoch-based naming
-        eval_dir = os.path.join(config.logdir if hasattr(config, 'logdir') else "./logs", config.run_name if hasattr(config, 'run_name') else "eval", f"epoch {epoch} eval")
-        os.makedirs(eval_dir, exist_ok=True)
-
-        # 限制保存的视频数量为max_eval_samples（默认7个）
-        num_samples = min(max_eval_samples, len(last_batch_videos_gather))
-        sample_indices = range(num_samples)
-
-        # Convert videos to numpy frames and save as video files
-        # Convert numpy array back to torch tensor for tensor2video
-        videos_tensor = torch.from_numpy(last_batch_videos_gather).float()
-        # source_videos_tensor = torch.from_numpy(last_batch_source_videos_gather).float()  # <-- Remove
-        gt_videos_tensor = torch.from_numpy(last_batch_gt_videos_gather).float()   # <-- Add gather for gt_videos
-
-        # Check if values are in [0, 1] range (VAE decode output) or [-1, 1] range
-        # tensor2video expects values in [-1, 1] range
-        if videos_tensor.min() >= 0 and videos_tensor.max() <= 1:
-            # Convert [0, 1] -> [-1, 1]
-            videos_tensor = videos_tensor * 2.0 - 1.0
-        # if source_videos_tensor.min() >= 0 and source_videos_tensor.max() <= 1:
-        #     source_videos_tensor = source_videos_tensor * 2.0 - 1.0  # <-- Remove
-        if gt_videos_tensor.min() >= 0 and gt_videos_tensor.max() <= 1:
-            gt_videos_tensor = gt_videos_tensor * 2.0 - 1.0   # <-- Range check & normalization
-
-        for idx, index in enumerate(sample_indices):
-            video = videos_tensor[index]  # (C, T, H, W)
-            # source_video = source_videos_tensor[index]  # (C, T, H, W)   # <-- Remove
-            gt_video = gt_videos_tensor[index]  # (C, T, H, W)
-
-            # Use pipeline's tensor2video method to convert to PIL Images
-            video_frames = pipeline.tensor2video(video)  # List of PIL Images
-            # source_video_frames = pipeline.tensor2video(source_video)  # List of PIL Images  # <-- Remove
-            gt_video_frames = pipeline.tensor2video(gt_video)  # List of PIL Images
-
-            # Save output video
-            output_video_path = os.path.join(eval_dir, f"output_video_{idx}.mp4")
-            save_video(video_frames, output_video_path, fps=20, quality=5)
-
-            # Save gt video
-            gt_video_path = os.path.join(eval_dir, f"gt_video_{idx}.mp4")
-            save_video(gt_video_frames, gt_video_path, fps=20, quality=5)
-
+        # Limit saved samples to max_eval_samples
+        num_samples = min(max_eval_samples, len(gathered_video_paths))
+        
         # Save reward information as JSON
         reward_info = []
-        for idx, index in enumerate(sample_indices):
-            prompt = last_batch_prompts_gather[index] if index < len(last_batch_prompts_gather) else ""
-            reward_dict = {k: float(last_batch_rewards_gather[k][index]) for k in last_batch_rewards_gather if index < len(last_batch_rewards_gather[k])}
+        for idx in range(num_samples):
+            prompt = gathered_prompts[idx] if idx < len(gathered_prompts) else ""
+            reward_dict = {
+                k: float(gathered_rewards[k][idx]) 
+                for k in gathered_rewards 
+                if idx < len(gathered_rewards[k])
+            }
+            # Use actual video filename (relative to eval_dir)
+            video_filename = os.path.basename(gathered_video_paths[idx]) if idx < len(gathered_video_paths) else f"output_video_{idx}.mp4"
             reward_info.append({
                 "sample_idx": idx,
                 "prompt": prompt,
                 "rewards": reward_dict,
-                "output_video_path": f"output_video_{idx}.mp4",
-                # "source_video_path": f"source_video_{idx}.mp4",  # <-- Remove source path from JSON info
-                "gt_video_path": f"gt_video_{idx}.mp4",     # Add gt_video path into JSON info
+                "output_video_path": video_filename,
             })
 
-        with open(os.path.join(eval_dir, "reward_info.json"), "w", encoding="utf-8") as f:
+        reward_info_path = os.path.join(eval_dir, "reward_info.json")
+        with open(reward_info_path, "w", encoding="utf-8") as f:
             json.dump(reward_info, f, ensure_ascii=False, indent=2)
 
-        # Log reward statistics to wandb (without images)
-        for key, value in all_rewards.items():
-            print(f"eval_reward_{key}: shape={value.shape}, mean={np.mean(value[value != -10])}")
+        # Log reward statistics to wandb
+        log_dict = {}
+        for key, value in gathered_rewards.items():
+            if '_strict_accuracy' not in key and '_accuracy' not in key:
+                if isinstance(value, (list, np.ndarray)):
+                    # Filter out invalid values (e.g., -10 used as placeholder)
+                    valid_values = value[value != -10] if isinstance(value, np.ndarray) else [v for v in value if v != -10]
+                    if len(valid_values) > 0:
+                        log_dict[f"eval_reward_{key}"] = np.mean(valid_values)
+                elif isinstance(value, (int, float)) and value != -10:
+                    log_dict[f"eval_reward_{key}"] = value
 
-        wandb.log(
-            {
-                **{f"eval_reward_{key}": np.mean(value[value != -10]) for key, value in all_rewards.items()},
-            },
-            step=global_step,
-        )
+        # Log detailed metrics (sub-metrics)
+        reward_fn_names = set(config.reward_fn.keys())
+        for key, value in gathered_rewards.items():
+            if key not in ['avg'] and '_' in key:
+                is_detail_metric = False
+                for reward_name in reward_fn_names:
+                    if key.startswith(f"{reward_name}_") and key != reward_name:
+                        is_detail_metric = True
+                        break
+                
+                if is_detail_metric:
+                    if isinstance(value, (list, np.ndarray)):
+                        valid_values = value[value != -10] if isinstance(value, np.ndarray) else [v for v in value if v != -10]
+                        if len(valid_values) > 0:
+                            log_dict[f"eval_reward_{key}"] = np.mean(valid_values)
+                    elif isinstance(value, (int, float)) and value != -10:
+                        log_dict[f"eval_reward_{key}"] = value
 
-        logger.info(f"Eval videos saved to {eval_dir}")
+        wandb.log(log_dict, step=global_step)
 
+        logger.info(f"Eval completed: {num_samples} samples evaluated, videos saved to {eval_dir}")
+        logger.info(f"Eval rewards: {log_dict}")
+
+    # Restore EMA if used
     if config.train.ema:
         ema.copy_temp_to(transformer_trainable_parameters)
 
@@ -1348,22 +1370,18 @@ def main(_):
     for epoch in range(first_epoch, config.num_epochs):
         ################### EVAL ####################
         pipe.dit.eval()
+
         if epoch % config.eval_freq == 0 and epoch > 0:
-            eval(pipe, test_dataloader, test_neg_prompt_embed, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters, epoch)
+            eval(pipe, test_dataloader, test_neg_prompt_embed, config, accelerator, global_step, eval_reward_fn, executor, autocast, ema, transformer_trainable_parameters, epoch)
         if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
             logger.info(f"Saving checkpoint at epoch {epoch}")
             save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
-
+        
         #################### SAMPLING ####################
         # 确保 SAMPLING 阶段所需的模型在正确的设备上
         # VAE 需要在 decode 阶段使用，Text Encoder 可能不需要（prompt 已预编码）
         # 但在某些情况下可能需要重新加载，所以先确保它们在设备上
         pipe.dit.eval()
-        
-        # 确保 VAE 在设备上（sampling 阶段可能需要 decode）
-        pipe.vae.to(accelerator.device)
-        # 确保 Text Encoder 在设备上（虽然 prompt 已编码，但为保险起见）
-        pipe.text_encoder.to(accelerator.device)
         
         # 清空缓存，为 sampling 阶段做准备
         torch.npu.empty_cache()
@@ -1454,7 +1472,6 @@ def main(_):
                             target_camera=target_camera,
                             num_inference_steps=config.sample.num_steps,
                             guidance_scale=config.sample.guidance_scale,
-                            output_type="tensor",
                             height=config.height,
                             width=config.width,
                             num_frames=config.num_frames
@@ -1482,6 +1499,7 @@ def main(_):
 
             # Repeat scheduler timesteps for each element in the batch
             timesteps = pipe.scheduler.timesteps.repeat(config.sample.train_batch_size, 1)  # (batch_size, num_steps)
+
             timesteps = timesteps.to(accelerator.device)
 
             # 保存每个进程、每个batch的所有视频(每个batch有batch_size个视频)，保存到 kankanK 文件夹下
@@ -1587,7 +1605,6 @@ def main(_):
             logger.info("sample['rewards']", sample["rewards"])
 
 
-
         # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
         samples = {
             k: torch.cat([s[k] for s in samples], dim=0)
@@ -1610,10 +1627,6 @@ def main(_):
         # gather rewards across processes
         gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
         gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
-
-
-        
-
 
         
         # log rewards and images
@@ -1756,6 +1769,7 @@ def main(_):
             }, step=global_step)
         # Filter out samples where the entire time dimension of advantages is zero
         samples = {k: v[mask] for k, v in samples.items()}
+
 
         # samples["timesteps"]
         # 采样阶段（调用流水线生成轨迹）时，为每个样本保存的一维时间步序列，形状是 (batch, num_steps)

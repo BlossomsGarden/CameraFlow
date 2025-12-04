@@ -227,17 +227,24 @@ class DiTBlock(nn.Module):
         return x
 
 
+# 他妈的你抄都抄不明白是吧 t 能抄成 t_mod 还抄漏 unsqeeze 啊
+# https://github.com/Wan-Video/Wan2.1/blob/main/wan/modules/model.py
 class Head(nn.Module):
     def __init__(self, dim: int, out_dim: int, patch_size: Tuple[int, int, int], eps: float):
         super().__init__()
+
         self.dim = dim
         self.patch_size = patch_size
         self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.head = nn.Linear(dim, out_dim * math.prod(patch_size))
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
-    def forward(self, x, t_mod):
-        shift, scale = (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(2, dim=1)
+
+    def forward(self, x, t):
+        # Debug: print shapes to identify dimension mismatch (only print once to avoid spam)
+        # print(f"[DEBUG Head.forward] self.modulation.shape: {self.modulation.shape}, t.shape: {t.shape}, x.shape: {x.shape}")
+        # print(f"[DEBUG Head.forward] t.unsqueeze(1).shape: {t.unsqueeze(1).shape}")
+        shift, scale = (self.modulation + t.unsqueeze(1)).chunk(2, dim=1)
         x = (self.head(self.norm(x) * (1 + scale) + shift))
         return x
 
@@ -381,7 +388,17 @@ class WanModel(torch.nn.Module):
                 # inside DiTBlock.self_attn we apply a simplified RoPE along seq_len
                 x = block(x, context, cam_emb, t_mod, freqs)
 
+        
+        # print("="*100)
+        # print("x.shape", x.shape)           # x.shape torch.Size([2, 65520, 1536])
+        # print("t.shape", t.shape)           # t.shape torch.Size([2, 1536])
+        # print("t_mod.shape", t_mod.shape)   # t_mod.shape torch.Size([2, 6, 1536])
+        # print("="*100)
+
+        # t 时间嵌入，(batch_size, dim)
+        # t_mod 时间调制，用于不同的transformer block (batch_size, 6, dim)
         x = self.head(x, t)
+
         x = self.unpatchify(x, (f, h, w))
         return x.to(torch.bfloat16)
 

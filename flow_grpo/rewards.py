@@ -178,8 +178,9 @@ def my_reward():
         # 打印确认传入的参数格式
         print(f"[my_reward] output_video 类型: {type(output_video)}, gt_video: {gt_video}, cam_extrinsics 类型: {type(cam_extrinsics)}")
         # Return placeholder scores (list of zeros with length = batch_size)
-        batch_size = output_video.shape[0]
-        scores = [0.0] * batch_size
+        batch_size = len(output_video)
+        import random
+        scores = [random.random() for _ in range(batch_size)]
         return {
             'scores': scores,
             'details': {}
@@ -714,6 +715,10 @@ def cam_score(device, api_url=None, base_port=34567):
         trans_err_decay_factor = 0.3  # Decay factor for exponential decay (smaller = faster decay)
         trans_err_outlier_scale = 0.1  # Small scale factor for outlier range to maintain distinguishability
         
+        # Store individual scores for details
+        rot_scores_list = []
+        trans_scores_list = []
+        
         # Calculate scores for each error type, then combine
         for rot_err, trans_err in zip(rot_errs, trans_errs):
             # RotErr score: direct linear mapping
@@ -745,9 +750,13 @@ def cam_score(device, api_url=None, base_port=34567):
             rot_score = max(0.0, min(5.0, rot_score))
             trans_score = max(0.0, min(5.0, trans_score))
             
+            # Store individual scores for details
+            rot_scores_list.append(rot_score)
+            trans_scores_list.append(trans_score)
+            
             # Combine scores: weighted average (equal weights)
             # This gives a score in [0, 5] range where 5 is best and 0 is worst
-            combined_score = (rot_score + trans_score) / 2.0
+            combined_score = rot_score*0.8 + trans_score*0.2
             combined_score = max(0.0, min(5.0, combined_score))  # Clamp to [0, 5]
             scores.append(combined_score)
         
@@ -764,10 +773,10 @@ def cam_score(device, api_url=None, base_port=34567):
         return {
             'scores': scores,
             'details': {
-                'rot_err': rot_errs,
-                'trans_err': trans_errs,
-                'raw_rot_err': raw_rot_errs,
-                'raw_trans_err': raw_trans_errs
+                'rot_err': rot_scores_list,  # Store rot_score (computed score) instead of error
+                'trans_err': trans_scores_list,  # Store trans_score (computed score) instead of error
+                'raw_rot_err': raw_rot_errs,  # Keep raw error values from API
+                'raw_trans_err': raw_trans_errs  # Keep raw error values from API
             }
         }
     
